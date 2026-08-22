@@ -1,7 +1,8 @@
 (() => {
   const $ = id => document.getElementById(id);
   const ptt = $('ptt'), meter = $('meter'), rx = $('rx'), logEl = $('log'), state = $('state');
-  $('ver').textContent = 'v0.1';
+  const gear = $('gear'), settings = $('settings'), simbrief = $('simbrief'), callsign = $('callsign'), saveBtn = $('save'), closeBtn = $('close'), saved = $('saved');
+  $('ver').textContent = 'v0.1.1';
   let mediaRecorder = null, recording = false, ctx = null, analyser = null, raf = null, stream = null;
 
   function log(who, text) {
@@ -60,6 +61,8 @@
 
   async function sendAudio(blob) {
     const fd = new FormData(); fd.append('audio', blob, 'tx.wav');
+    if (callsign.value.trim()) fd.append('callsign', callsign.value.trim());
+    setState('transmitting…');
     try {
       const resp = await fetch('/api/chat', { method: 'POST', body: fd });
       const data = await resp.json();
@@ -75,6 +78,31 @@
   }
 
   ptt.addEventListener('pointerdown', e => { e.preventDefault(); startRecording(); });
+
+  // ---- settings panel ----
+  async function loadSettings() {
+    try {
+      const r = await fetch('/api/settings');
+      const d = await r.json();
+      if (d.simbrief_id) simbrief.value = d.simbrief_id;
+      if (d.callsign) callsign.value = d.callsign;
+    } catch (e) {}
+  }
+  gear.addEventListener('click', () => { settings.classList.toggle('open'); });
+  closeBtn.addEventListener('click', () => settings.classList.remove('open'));
+  saveBtn.addEventListener('click', async () => {
+    saveBtn.disabled = true;
+    try {
+      const r = await fetch('/api/settings', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ simbrief_id: simbrief.value.trim(), callsign: callsign.value.trim() })
+      });
+      if (r.ok) { saved.textContent = 'Saved ✓'; setTimeout(() => { saved.textContent=''; }, 2000); }
+      else saved.textContent = 'Save failed';
+    } catch (e) { saved.textContent = 'Save failed'; }
+    finally { saveBtn.disabled = false; }
+  });
+  loadSettings();
   ptt.addEventListener('pointerup', e => { e.preventDefault(); stopRecording(); });
   ptt.addEventListener('pointerleave', stopRecording);
   document.addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat) { e.preventDefault(); startRecording(); } });

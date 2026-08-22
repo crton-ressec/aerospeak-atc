@@ -14,6 +14,16 @@ header { display:flex; align-items:center; justify-content:space-between; paddin
 .brand span { color:var(--accent); }
 .freq { font-variant-numeric:tabular-nums; color:var(--dim); font-size:13px; }
 .freq b { color:var(--txt); font-weight:600; }
+.gear { background:var(--panel); border:1px solid var(--edge); color:var(--txt); border-radius:8px; padding:4px 10px; font-size:15px; cursor:pointer; margin-left:10px; }
+.settings { display:none; position:fixed; top:60px; right:16px; width:min(320px,90vw); background:var(--panel); border:1px solid var(--edge); border-radius:12px; padding:18px; z-index:20; box-shadow:0 20px 60px rgba(0,0,0,.5); }
+.settings.open { display:block; }
+.settings h3 { font-size:16px; margin-bottom:14px; color:var(--accent); }
+.settings label { display:block; font-size:12px; color:var(--dim); margin-bottom:12px; }
+.settings input { width:100%; margin-top:4px; background:var(--bg); color:var(--txt); border:1px solid var(--edge); border-radius:8px; padding:8px 10px; font-size:15px; }
+.settings .actions { display:flex; gap:8px; margin-top:4px; }
+.settings .actions button { flex:1; padding:9px; border-radius:8px; border:none; background:var(--accent); color:#081c14; font-weight:600; cursor:pointer; }
+.settings .actions button:nth-child(2) { background:var(--edge); color:var(--txt); }
+.settings .hint { margin-top:10px; font-size:12px; color:var(--accent); min-height:14px; }
 main { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:26px; padding:24px; }
 .rx-ind { display:flex; align-items:center; gap:8px; color:var(--dim); font-size:13px; letter-spacing:1px; text-transform:uppercase; }
 .rx-ind .dot { width:9px; height:9px; border-radius:50%; background:var(--dim); }
@@ -34,7 +44,21 @@ footer { padding:10px 18px; border-top:1px solid var(--edge); color:var(--dim); 
 </style>
 </head>
 <body>
-<header><div class="brand">Aero<span>Speak</span> ATC</div><div class="freq">FREQ <b id="freq">133.20</b></div></header>
+<header><div class="brand">Aero<span>Speak</span> ATC</div><div class="right"><span class="freq">FREQ <b id="freq">133.20</b></span><button class="gear" id="gear" title="Settings">⚙</button></div></header>
+<div class="settings" id="settings">
+  <h3>Settings</h3>
+  <label>SimBrief Pilot ID
+    <input id="simbrief" type="text" placeholder="e.g. 1053147" autocomplete="off">
+  </label>
+  <label>Your Callsign
+    <input id="callsign" type="text" placeholder="e.g. FFT1407" autocomplete="off">
+  </label>
+  <div class="actions">
+    <button id="save">Save</button>
+    <button id="close">Close</button>
+  </div>
+  <p class="hint" id="saved"></p>
+</div>
 <main>
   <div class="rx-ind" id="rx"><span class="dot"></span><span>RX</span></div>
   <div class="meter"><i id="meter"></i></div>

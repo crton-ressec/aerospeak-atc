@@ -16,10 +16,24 @@ from starlette.staticfiles import StaticFiles
 
 BASE = Path(__file__).parent
 (BASE / "audio").mkdir(parents=True, exist_ok=True)
+SETTINGS_FILE = BASE / "settings.json"
+
+def load_settings():
+    try:
+        return json.loads(SETTINGS_FILE.read_text())
+    except Exception:
+        return {}
+
+def save_settings(s):
+    SETTINGS_FILE.write_text(json.dumps(s, indent=2))
+
+SETTINGS = load_settings()
+
 GEMINI_KEY   = os.environ.get("GEMINI_KEY", "")
 ELEVEN_KEY   = os.environ.get("ELEVEN_KEY", "")
-SIMBRIEF_ID  = os.environ.get("SIMBRIEF_ID", "")
-VOICE_ID     = os.environ.get("ATC_VOICE", "IKne3meq5aSn9XLyUdCD")  # Charlie
+SIMBRIEF_ID  = SETTINGS.get("simbrief_id") or os.environ.get("SIMBRIEF_ID", "")
+VOICE_ID     = SETTINGS.get("voice") or os.environ.get("ATC_VOICE", "IKne3meq5aSn9XLyUdCD")  # Charlie
+CALLSIGN     = SETTINGS.get("callsign", "")
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_turbo_v2_5")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
@@ -130,10 +144,22 @@ def gemini_call(parts):
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 def gemini_transcribe(audio_bytes, mime):
-    """Transcribe pilot transmission with Gemini's built-in speech recognition."""
-    import base64
+    """Transcribe pilot's transmission. Convert any input to 16k mono WAV first
+    (Safari sends m4a/mp4 that Gemini's free API sometimes rejects), then send."""
+    import base64, subprocess, tempfile
+    with tempfile.NamedTemporaryFile(suffix=".in", delete=False) as tf:
+        tf.write(audio_bytes); tin = tf.name
+    tout = tin + ".wav"
+    try:
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", tin,
+                        "-ar", "16000", "-ac", "1", tout], check=True)
+        wav = open(tout, "rb").read()
+    finally:
+        for p in (tin, tout):
+            try: os.remove(p)
+            except OSError: pass
     parts = [{"text": "Transcribe the pilot's radio transmission verbatim. Output only the spoken words."},
-             {"inline_data": {"mime_type": mime, "data": base64.b64encode(audio_bytes).decode()}}]
+             {"inline_data": {"mime_type": "audio/wav", "data": base64.b64encode(wav).decode()}}]
     return gemini_call(parts)
 
 def gemini_reply(user_text):
@@ -215,9 +241,25 @@ async def audio(request):
         return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(path, media_type="audio/wav")
 
+async def api_settings(request):
+    if request.method == "GET":
+        return JSONResponse({"simbrief_id": SETTINGS.get("simbrief_id", ""),
+                            "callsign": SETTINGS.get("callsign", ""),
+                            "voice": SETTINGS.get("voice", "")})
+    body = await request.json()
+    if "simbrief_id" in body:
+        SETTINGS["simbrief_id"] = str(body["simbrief_id"]).strip()
+    if "callsign" in body:
+        SETTINGS["callsign"] = str(body["callsign"]).strip()
+    if "voice" in body:
+        SETTINGS["voice"] = str(body["voice"]).strip()
+    save_settings(SETTINGS)
+    return JSONResponse({"ok": True, "settings": SETTINGS})
+
 routes = [
     Route("/", index),
     Route("/api/chat", api_chat, methods=["POST"]),
+    Route("/api/settings", api_settings, methods=["GET", "POST"]),
     Route("/audio/{name}", audio),
     Mount("/static", StaticFiles(directory=str(BASE / "static"))),
 ]
