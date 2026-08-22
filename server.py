@@ -147,11 +147,13 @@ def gemini_transcribe(audio_bytes, mime):
     """Transcribe pilot's transmission. Convert any input to 16k mono WAV first
     (Safari sends m4a/mp4 that Gemini's free API sometimes rejects), then send."""
     import base64, subprocess, tempfile
+    import imageio_ffmpeg
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
     with tempfile.NamedTemporaryFile(suffix=".in", delete=False) as tf:
         tf.write(audio_bytes); tin = tf.name
     tout = tin + ".wav"
     try:
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", tin,
+        subprocess.run([ff, "-y", "-loglevel", "error", "-i", tin,
                         "-ar", "16000", "-ac", "1", tout], check=True)
         wav = open(tout, "rb").read()
     finally:

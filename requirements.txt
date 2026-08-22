@@ -4,3 +4,4 @@ numpy
 scipy
 requests
 python-multipart
+imageio-ffmpeg
