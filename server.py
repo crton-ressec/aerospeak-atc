@@ -15,6 +15,7 @@ from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
 
 BASE = Path(__file__).parent
+(BASE / "audio").mkdir(parents=True, exist_ok=True)
 GEMINI_KEY   = os.environ.get("GEMINI_KEY", "")
 ELEVEN_KEY   = os.environ.get("ELEVEN_KEY", "")
 SIMBRIEF_ID  = os.environ.get("SIMBRIEF_ID", "")
