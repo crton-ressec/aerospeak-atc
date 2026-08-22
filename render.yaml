@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: aerospeak-atc
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GEMINI_KEY
+        sync: false
+      - key: ELEVEN_KEY
+        sync: false
+      - key: SIMBRIEF_ID
+        sync: false
+      - key: ATC_VOICE
+        value: IKne3meq5aSn9XLyUdCD
+      - key: GEMINI_MODEL
+        value: gemini-3.6-flash

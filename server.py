@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""AeroSpeak ATC — AI ATC for console flight simmers.
+Hold-to-talk web radio: Gemini hears you, replies as a controller,
+Charlie (ElevenLabs) speaks with VHF radio degradation."""
+
+import io, json, os, re, uuid, wave
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+import numpy as np
+from scipy.signal import butter, sosfiltfilt, lfilter
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse, FileResponse, Response
+from starlette.routing import Route, Mount
+from starlette.staticfiles import StaticFiles
+
+BASE = Path(__file__).parent
+GEMINI_KEY   = os.environ.get("GEMINI_KEY", "")
+ELEVEN_KEY   = os.environ.get("ELEVEN_KEY", "")
+SIMBRIEF_ID  = os.environ.get("SIMBRIEF_ID", "")
+VOICE_ID     = os.environ.get("ATC_VOICE", "IKne3meq5aSn9XLyUdCD")  # Charlie
+ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_turbo_v2_5")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+
+def simbrief_summary():
+    try:
+        req = Request(f"https://www.simbrief.com/api/xml.fetcher.php?userid={SIMBRIEF_ID}",
+                      headers={"User-Agent": "AeroSpeakATC/0.1"})
+        with urlopen(req, timeout=10) as r:
+            xml = r.read().decode("utf-8", "ignore")
+        def tog(name):
+            m = re.search(rf"<{name}>(.*?)</{name}>", xml, re.S)
+            return m.group(1).strip() if m else ""
+        return (f"PILOT'S FILED FLIGHT PLAN: callsign {tog('callsign')}, "
+                f"aircraft {tog('icaocode')}, {tog('orig_icao')} -> {tog('dest_icao')}, "
+                f"route {tog('route')}, cruise {tog('cruise_altitude')} ft.")
+    except Exception as e:
+        return f"(no live SimBrief plan: {e})"
+
+PLAN = simbrief_summary() if SIMBRIEF_ID else "(no SimBrief ID configured)"
+
+SYSTEM_PROMPT = f"""You are an AI air traffic controller at a US towered airport, speaking on VHF radio.
+You communicate in standard, concise ATC phraseology: callsign first, then the instruction, then frequency.
+You ONLY handle pre-departure ops: ATIS, clearance delivery, ground (pushback and taxi), and tower (takeoff).
+After takeoff clearance, end with a quick departure handoff like 'Contact departure on one two six point one five, good day.'
+Never give radar vectors, approaches, or beyond-departure instruction. Keep replies under 45 words.
+Read numbers as spoken ATC (e.g. 'two five zero', 'flight level two zero zero', 'squawk one two three four').
+If the pilot says something non-aviation, respond in character with a sharp radio-style quip and steer back to procedure.
+CONTEXT: {PLAN}"""
+
+HISTORY: list[dict] = []
+
+# ---------------------------------------------------------------- audio
+CLICK_OPEN = None
+CLICK_CLOSE = None
+
+def _load_click(name):
+    p = BASE / "static" / name
+    return load_wav_bytes(p.read_bytes()) if p.exists() else None
+
+def load_wav_bytes(b: bytes, sr=44100):
+    with wave.open(io.BytesIO(b)) as w:
+        got = w.getframerate()
+        a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float64) / 32768.0
+    if got != sr and len(a) > 1:
+        x = np.linspace(0, 1, len(a))
+        a = np.interp(np.linspace(0, 1, int(len(a) * sr / got)), x, a)
+    return a
+
+def encode_wav(a, sr=44100):
+    amax = np.max(np.abs(a)) + 1e-12
+    if amax > 0.96:
+        a = a / amax * 0.96
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        w.writeframes((a * 32767).astype(np.int16).tobytes())
+    return buf.getvalue()
+
+def bandpass(x, sr, lo, hi, order=4):
+    return sosfiltfilt(butter(order, [max(lo,1)/(sr/2), min(hi, (sr/2)-1)/(sr/2)], "band", output="sos"), x)
+
+def compress(x, sr, threshold=0.22, ratio=10., rel=0.15, makeup=3.2):
+    env = np.abs(x)
+    env = np.maximum(env, np.convolve(env, np.ones(int(sr*0.005))/int(sr*0.005), mode="same"))
+    aa = np.exp(-1/(sr*rel))
+    env = lfilter([1-aa], [1, -aa], env)
+    over = env - threshold
+    g = np.ones_like(env)
+    idx = over > 0
+    g[idx] = threshold/over[idx]*(1-1/10.0)+(1/10.0)
+    g = np.clip(g, 0, 1)
+    return x * g * makeup
+
+def radio_fx(pcm, sr):
+    v = bandpass(pcm, sr, 250, 3000, 3)
+    v = compress(v, sr, 0.16, 10, makeup=3.2)
+    v = compress(v, sr, 0.05, 4, makeup=2.4)
+    v = np.tanh(v*1.8)/np.tanh(1.8)
+    rng = np.random.default_rng(7)
+    hiss = rng.normal(0, 1, len(v))
+    hiss = bandpass(hiss, sr, 1500, 5000, 2)
+    hiss *= 0.10
+    env = np.abs(v)
+    env = np.convolve(env, np.ones(int(sr*0.05))/int(sr*0.05), mode="same")
+    env = env/(np.max(env)+1e-12)
+    duck = 1.0 - np.clip(env*0.85, 0, 0.88)
+    eff = hiss * duck
+    pop  = _load_click("click-open.wav")[:int(0.07*sr)] if _load_click("click-open.wav") is not None else np.zeros(int(0.07*sr))
+    popc = _load_click("click-close.wav")[:int(0.12*sr)] if _load_click("click-close.wav") is not None else np.zeros(int(0.12*sr))
+    off = int(0.12*sr)
+    mix = np.zeros(off + len(v) + len(popc) + int(0.6*sr))
+    mix[off-len(pop):off] += pop*1.5
+    mix[off:off+len(v)] += v
+    mix[off+len(v):off+len(v)+len(popc)] += popc*1.4
+    mix[:len(eff)] += eff
+    mix = np.tanh(mix*1.4)/np.tanh(1.4)
+    return mix
+
+# ---------------------------------------------------------------- gemini
+def gemini_call(parts):
+    payload = json.dumps({"contents": parts}).encode()
+    req = Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        data=payload, headers={"Content-Type": "application/json",
+                               "x-goog-api-key": GEMINI_KEY})
+    with urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode())
+    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+def gemini_transcribe(audio_bytes, mime):
+    """Transcribe pilot transmission with Gemini's built-in speech recognition."""
+    import base64
+    parts = [{"text": "Transcribe the pilot's radio transmission verbatim. Output only the spoken words."},
+             {"inline_data": {"mime_type": mime, "data": base64.b64encode(audio_bytes).decode()}}]
+    return gemini_call(parts)
+
+def gemini_reply(user_text):
+    parts = []
+    for h in HISTORY[-8:]:
+        parts.append({"role": h["role"], "parts": [{"text": h["parts"][0]["text"]}]})
+    parts.append({"role": "user", "parts": [{"text": user_text}]})
+    parts.insert(0, {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]})
+    parts.insert(1, {"role": "model", "parts": [{"text": "Understood. Standing by on frequency."}]})
+    reply = gemini_call(parts)
+    HISTORY.append({"role": "user", "parts": [{"text": user_text}]})
+    HISTORY.append({"role": "model", "parts": [{"text": reply}]})
+    return reply
+
+# ---------------------------------------------------------------- eleven
+def eleven_speak(text):
+    payload = json.dumps({
+        "text": text,
+        "model_id": ELEVEN_MODEL,
+        "voice_settings": {"stability": 0.55, "similarity_boost": 0.8,
+                           "style": 0.0, "use_speaker_boost": True}
+    }).encode()
+    req = Request(f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}",
+                  data=payload, headers={"xi-api-key": ELEVEN_KEY,
+                                         "Content-Type": "application/json"})
+    with urlopen(req, timeout=60) as r:
+        mp3 = r.read()
+    tmp = BASE / "audio" / f"{uuid.uuid4().hex}.mp3"
+    tmp.write_bytes(mp3)
+    return tmp
+
+# ---------------------------------------------------------------- routes
+async def index(request):
+    return FileResponse(BASE / "static" / "index.html")
+
+async def api_chat(request):
+    import base64
+    ctype = request.headers.get("content-type", "")
+    if ctype.startswith("multipart/form-data"):
+        form = await request.form()
+        upload = form.get("audio")
+        if upload is None:
+            return JSONResponse({"error": "no audio field"}, status_code=400)
+        audio_bytes = await upload.read()
+        mime = upload.content_type or "audio/webm"
+        try:
+            text = gemini_transcribe(audio_bytes, mime)
+        except Exception as e:
+            return JSONResponse({"error": f"transcribe: {e}"}, status_code=502)
+    else:
+        body = await request.json()
+        text = (body.get("text") or "").strip()
+        if not text:
+            return JSONResponse({"error": "empty"}, status_code=400)
+
+    try:
+        reply = gemini_reply(text)
+    except Exception as e:
+        return JSONResponse({"error": f"Gemini: {e}"}, status_code=502)
+
+    try:
+        mp3 = eleven_speak(reply)
+        wav = mp3.with_suffix(".wav")
+        import subprocess
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3), "-ar", "44100", "-ac", "1", str(wav)], check=True)
+        pcm = load_wav_bytes(wav.read_bytes())
+        fx = encode_wav(radio_fx(pcm, 44100))
+        out = BASE / "audio" / f"{uuid.uuid4().hex}.wav"
+        out.write_bytes(fx)
+    except Exception as e:
+        return JSONResponse({"error": f"TTS: {e}", "text": reply}, status_code=502)
+
+    return JSONResponse({"text": reply, "audio": f"/audio/{out.name}"})
+
+async def audio(request):
+    name = request.path_params["name"]
+    path = BASE / "audio" / name
+    if not path.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(path, media_type="audio/wav")
+
+routes = [
+    Route("/", index),
+    Route("/api/chat", api_chat, methods=["POST"]),
+    Route("/audio/{name}", audio),
+    Mount("/static", StaticFiles(directory=str(BASE / "static"))),
+]
+app = Starlette(routes=routes)
+application = app

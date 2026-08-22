@@ -1,0 +1,6 @@
+starlette
+uvicorn
+numpy
+scipy
+requests
+python-multipart

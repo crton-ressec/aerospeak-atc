@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>AeroSpeak ATC</title>
+<style>
+:root { --bg:#0b0e13; --panel:#131821; --edge:#1f2836; --txt:#dce4ee; --dim:#7a8799; --accent:#56c2a0; --warn:#ffb454; }
+* { box-sizing:border-box; margin:0; padding:0; }
+html,body { height:100%; }
+body { background:var(--bg); color:var(--txt); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; display:flex; flex-direction:column; min-height:100vh; }
+header { display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid var(--edge); }
+.brand { font-weight:700; letter-spacing:.5px; font-size:17px; }
+.brand span { color:var(--accent); }
+.freq { font-variant-numeric:tabular-nums; color:var(--dim); font-size:13px; }
+.freq b { color:var(--txt); font-weight:600; }
+main { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:26px; padding:24px; }
+.rx-ind { display:flex; align-items:center; gap:8px; color:var(--dim); font-size:13px; letter-spacing:1px; text-transform:uppercase; }
+.rx-ind .dot { width:9px; height:9px; border-radius:50%; background:var(--dim); }
+.rx-ind.live .dot { background:#e34; box-shadow:0 0 12px #e34a; animation:pulse 1.2s infinite; }
+@keyframes pulse { 50% { opacity:.35; } }
+.meter { width:min(400px,82vw); height:10px; background:var(--panel); border:1px solid var(--edge); border-radius:6px; overflow:hidden; }
+.meter i { display:block; height:100%; width:0%; background:linear-gradient(90deg,#3d8,#2c6); transition:width .1s; }
+button.ptt { width:190px; height:190px; border-radius:50%; border:3px solid var(--edge); background:radial-gradient(circle at 30% 30%, #1a2230, #12161e); color:var(--txt); font-size:19px; font-weight:700; letter-spacing:1px; cursor:pointer; user-select:none; -webkit-tap-highlight-color:transparent; touch-action:none; box-shadow:0 12px 30px rgba(0,0,0,.45); transition:transform .08s, background .08s; }
+button.ptt:active, button.ptt.hold { background:radial-gradient(circle at 30% 30%, #c0392b, #8e2a1f); transform:scale(.96); border-color:#e34; box-shadow:0 0 30px rgba(227,68,52,.35); }
+.hint { color:var(--dim); font-size:13px; }
+.log { width:min(560px,92vw); max-height:170px; overflow-y:auto; border:1px solid var(--edge); border-radius:10px; background:var(--panel); padding:10px 12px; display:flex; flex-direction:column; gap:8px; }
+.log .msg { font-size:13px; line-height:1.5; }
+.log .msg .who { font-weight:700; margin-right:6px; }
+.log .pilot .who { color:var(--warn); }
+.log .atc .who { color:var(--accent); }
+.log .sys { color:var(--dim); font-style:italic; }
+footer { padding:10px 18px; border-top:1px solid var(--edge); color:var(--dim); font-size:11px; display:flex; justify-content:space-between; }
+</style>
+</head>
+<body>
+<header><div class="brand">Aero<span>Speak</span> ATC</div><div class="freq">FREQ <b id="freq">133.20</b></div></header>
+<main>
+  <div class="rx-ind" id="rx"><span class="dot"></span><span>RX</span></div>
+  <div class="meter"><i id="meter"></i></div>
+  <button class="ptt" id="ptt">HOLD TO TALK</button>
+  <div class="hint">Hold to transmit · release to hear the reply</div>
+  <div class="log" id="log"></div>
+</main>
+<footer><span>AeroSpeak ATC <span id="ver"></span></span><span id="state">ready</span></footer>
+<script src="/static/app.js"></script>
+</body>
+</html>
