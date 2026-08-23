@@ -2,7 +2,7 @@
   const $ = id => document.getElementById(id);
   const ptt = $('ptt'), meter = $('meter'), rx = $('rx'), logEl = $('log'), state = $('state');
   const gear = $('gear'), settings = $('settings'), simbrief = $('simbrief'), callsign = $('callsign'), saveBtn = $('save'), closeBtn = $('close'), saved = $('saved');
-  $('ver').textContent = 'v0.1.1';
+  $('ver').textContent = 'v0.2.0';
   let mediaRecorder = null, recording = false, ctx = null, analyser = null, raf = null, stream = null;
 
   function log(who, text) {
@@ -89,7 +89,12 @@
         return;
       }
       log('atc', data.text || '');
-      if (data.audio) playAudio(data.audio);
+      if (data.audio) {
+        const abs = data.audio.startsWith('http') ? data.audio : location.origin + data.audio;
+        // Try autoplay; for strict browsers (Aloha/Safari) show a tappable play button.
+        playAudio(abs);
+        addPlayButton(abs);
+      }
       setState('ready');
     } catch (e) { log('sys', 'Network error: ' + e.message); setState('error'); setTimeout(() => setState('ready'), 1500); }
   }
@@ -97,7 +102,19 @@
   function playAudio(url) {
     const abs = url.startsWith('http') ? url : location.origin + url;
     const audio = new Audio(abs);
-    audio.play().catch(() => log('sys', 'Tap to enable audio'));
+    audio.play().catch(() => {}); // strict browsers: rely on the play button below
+  }
+
+  function addPlayButton(url) {
+    const abs = url.startsWith('http') ? url : location.origin + url;
+    const row = document.createElement('div');
+    row.className = 'msg playrow';
+    row.innerHTML = `<button class="playbtn" type="button">▶ Play ATC audio</button>`;
+    row.querySelector('.playbtn').addEventListener('click', () => {
+      const a = new Audio(abs);
+      a.play().catch(() => log('sys', 'Still blocked — tap volume or open in Safari'));
+    });
+    logEl.appendChild(row); logEl.scrollTop = logEl.scrollHeight;
   }
 
   ptt.addEventListener('pointerdown', e => { e.preventDefault(); unlockAudio(); startRecording(); });
