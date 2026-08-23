@@ -119,11 +119,110 @@
 
   ptt.addEventListener('pointerdown', e => { e.preventDefault(); unlockAudio(); startRecording(); });
 
+  // ---- airport + frequency ----
+  let curIcao = '', curFreqType = 'GND', curFreqs = {};
+  const freqLabel = { 'ATIS':'ATIS', 'CLD':'CLNCE', 'GND':'GND', 'TWR':'TWR', 'APP':'APPROACH', 'DEP':'DEPARTURE' };
+  const apsearch = $('apsearch'), apresults = $('apresults'), freqrow = $('freqrow'), freqBadge = $('freqBadge');
+
+  function setFreq(type) {
+    curFreqType = type;
+    const f = curFreqs[type];
+    freqBadge.innerHTML = f ? `FREQ <b>${f.toFixed(3)}</b>` : (type === 'ATIS' ? 'ATIS · <b>press to play</b>' : 'FREQ —');
+    renderFreqs();
+  }
+  function renderFreqs() {
+    freqrow.innerHTML = '';
+    ['ATIS','CLD','GND','TWR','APP','DEP'].forEach(t => {
+      const f = curFreqs[t];
+      const b = document.createElement('button');
+      b.className = 'fbt' + (t === curFreqType ? ' active' : '');
+      b.innerHTML = `<span class="type">${freqLabel[t]}</span>${f ? f.toFixed(3) : '—'}`;
+      b.onclick = () => {
+        if (t === 'ATIS') { playAtis(); return; }
+        setFreq(t);
+      };
+      freqrow.appendChild(b);
+    });
+  }
+  async function loadFreqs(icao) {
+    curIcao = icao; curFreqs = {};
+    try {
+      const r = await fetch('/api/frequencies/' + icao);
+      if (r.ok) { const d = await r.json(); curFreqs = d.freqs || {}; }
+    } catch (e) {}
+    // Show GND (or TWR if no GND, else CLD) by default
+    if (curFreqs.GND) setFreq('GND');
+    else if (curFreqs.TWR) setFreq('TWR');
+    else setFreq('ATIS');
+    if (curFreqs.ATIS) setFreq('ATIS');
+  }
+  async function selectAirport(icao) {
+    apsearch.value = icao;
+    apresults.classList.remove('open');
+    await loadSettings({ icao });
+    await playFreqs(icao);
+  }
+  async function playFreqs(icao) {
+    curIcao = icao; curFreqs = {};
+    try {
+      const r = await fetch('/api/frequencies/' + icao);
+      if (r.ok) { const d = await r.json(); curFreqs = d.freqs || {}; }
+    } catch (e) {}
+    // Default to TWR if available, else GND, else ATIS
+    if (curFreqs.TWR) setFreq('TWR');
+    else if (curFreqs.GND) setFreq('GND');
+    else if (curFreqs.ATIS) setFreq('ATIS');
+    else setFreq('CLD');
+  }
+  async function playAtis() {
+    if (!curIcao) { log('sys', 'Select an airport first'); return; }
+    setState('getting ATIS…');
+    try {
+      const r = await fetch('/api/atis/' + curIcao);
+      const d = await r.json();
+      if (!r.ok) { log('sys', 'ATIS: ' + (d.error || 'unavailable')); setState('ready'); return; }
+      log('atc', '📻 ' + d.atis);
+      setFreq('ATIS');
+      setState('ready');
+      // Play ATIS via TTS if an audio URL is provided
+      if (d.audio) {
+        const abs = d.audio.startsWith('http') ? d.audio : location.origin + d.audio;
+        playAudio(abs); addPlayButton(abs);
+      }
+    } catch (e) { log('sys', 'ATIS error: ' + e.message); setState('ready'); }
+  }
+  async function searchAirports(q) {
+    if (!q || q.length < 2) { apresults.classList.remove('open'); return; }
+    try {
+      const r = await fetch('/api/airports?q=' + encodeURIComponent(q));
+      const d = await r.json();
+      apresults.innerHTML = '';
+      (d.airports || []).forEach(a => {
+        const row = document.createElement('div');
+        row.className = 'ap';
+        row.innerHTML = `<span><b>${a.icao}</b> ${a.name} · ${a.city} ${a.country}</span><span class="dim">${(a.freqs?.GND || a.freqs?.TWR || '').toFixed(3) || ''}</span>`;
+        row.onclick = () => { selectAirport(a.icao); };
+        apresults.appendChild(row);
+      });
+      if (d.airports.length) apresults.classList.add('open'); else apresults.classList.remove('open');
+    } catch (e) {}
+  }
+  apsearch.addEventListener('input', () => searchAirports(apsearch.value.trim()));
+  apsearch.addEventListener('focus', () => { if (apsearch.value.trim().length >= 2) searchAirports(apsearch.value.trim()); });
+  document.addEventListener('click', e => { if (!e.target.closest('.aprow')) apresults.classList.remove('open'); });
+
   // ---- settings panel ----
-  async function loadSettings() {
+  async function loadSettings({ icao } = {}) {
     try {
       const r = await fetch('/api/settings');
       const d = await r.json();
+      if (icao) {
+        await fetch('/api/settings', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ airport: icao })
+        });
+      }
+      if (d.airport) { playFreqs(d.airport); }
       if (d.simbrief_id) simbrief.value = d.simbrief_id;
       if (d.callsign) callsign.value = d.callsign;
     } catch (e) {}
@@ -135,7 +234,7 @@
     try {
       const r = await fetch('/api/settings', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ simbrief_id: simbrief.value.trim(), callsign: callsign.value.trim() })
+        body: JSON.stringify({ simbrief_id: simbrief.value.trim(), callsign: callsign.value.trim(), airport: curIcao })
       });
       if (r.ok) { saved.textContent = 'Saved ✓'; setTimeout(() => { saved.textContent=''; }, 2000); }
       else saved.textContent = 'Save failed';

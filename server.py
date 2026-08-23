@@ -29,10 +29,92 @@ def save_settings(s):
     SETTINGS_FILE.write_text(json.dumps(s, indent=2))
 
 SETTINGS = load_settings()
+_ATIS_ROLL = {}  # airports that have had ATIS generated this session (letter roll)
+
+SIMBRIEF_ID  = SETTINGS.get("simbrief_id") or os.environ.get("SIMBRIEF_ID", "")
+ATC_VOICE    = SETTINGS.get("voice") or os.environ.get("ATC_VOICE", "IKne3meq5aSn9XLyUdCD")
 
 GEMINI_KEY   = os.environ.get("GEMINI_KEY", "")
 ELEVEN_KEY   = os.environ.get("ELEVEN_KEY", "")
-SIMBRIEF_ID  = SETTINGS.get("simbrief_id") or os.environ.get("SIMBRIEF_ID", "")
+PLAN = simbrief_summary() if SIMBRIEF_ID else "(no SimBrief ID configured)"
+
+# ---------------------------------------------------------------- airport data
+# Packed OurAirports dataset (US/CA/global medium+large airports, runways)
+import json as _json
+AIRPORT_FILE = BASE / "data" / "airports.json"
+APTS = {}
+if AIRPORT_FILE.exists():
+    try:
+        APTS = _json.loads(AIRPORT_FILE.read_text())
+    except Exception:
+        APTS = {}
+
+METAR_URL = "https://aviationweather.gov/api/data/metar?ids={icao}&format=json&taf=false&hours=1"
+
+import urllib.parse as _up
+
+
+def fetch_metar(icao):
+    """Fetch a METAR for icao; returns dict with raw + parsed bits."""
+    try:
+        url = METAR_URL.format(icao=_up.quote(icao))
+        req = Request(url, headers={"User-Agent": "AeroSpeakATC/0.1"})
+        with urlopen(req, timeout=10) as r:
+            arr = _json.loads(r.read().decode())
+        if not arr:
+            return None
+        raw = arr[0].get("rawOb") or arr[0].get("raw_text") or ""
+        wind = arr[0].get("wdir"), arr[0].get("wspd"), arr[0].get("wgst")
+        alt = arr[0].get("altim")
+        vis = arr[0].get("visib")
+        ceil = arr[0].get("cloudbase_feet_agl")
+        return {"raw": raw, "wind_dir": wind[0], "wind_spd": wind[1], "wind_gust": wind[2],
+                "altim": alt, "visib": vis, "ceil": ceil}
+    except Exception:
+        return None
+
+
+def active_runways(arpt, wind_dir):
+    """Pick best runway(s) for a wind direction: headwind at the threshold."""
+    rws = arpt.get("r", [])
+    if not rws:
+        return []
+    if not wind_dir:
+        # no wind data: prefer the longest
+        best = sorted(rws, key=lambda r: -r[2])[:2]
+        return [r[0] for r in best]
+    scored = []
+    for ident, hdg, ln, surf in rws:
+        diff = abs((hdg - wind_dir + 180) % 360 - 180)  # headwind angle
+        scored.append((diff, ln, ident))
+    scored.sort(key=lambda x: (x[0], -x[1]))
+    return [x[2] for x in scored[:2]]
+
+
+def airport_context(icao):
+    """Build a compact ATC context string for a given airport."""
+    if not icao:
+        return "", None
+    arpt = APTS.get(icao.upper())
+    if not arpt:
+        return f"(airport {icao.upper()} not in local dataset)", {"icao": icao.upper()}
+    metar = fetch_metar(icao.upper())
+    parts = [
+        f"AIRPORT: {arpt.get('n')} ({icao.upper()}), {arpt.get('m')}, elev {arpt.get('e')} ft",
+    ]
+    if arpt.get("r"):
+        lines = ", ".join(f"{i}/{l}" for i, h, l, s in arpt["r"][:12])
+        parts.append(f"RUNWAYS: {lines}")
+    if metar and metar.get("raw"):
+        parts.append(f"METAR: {metar['raw']}")
+        wdir = metar.get("wind_dir")
+        if wdir:
+            act = active_runways(arpt, wdir)
+            if act:
+                parts.append(f"ACTIVE RUNWAYS (wind {wdir}/{metar.get('wind_spd')}kt): {', '.join(act)}")
+    ctx = "\n".join(parts)
+    return ctx, {"icao": icao.upper(), "metar": metar}
+
 VOICE_ID     = SETTINGS.get("voice") or os.environ.get("ATC_VOICE", "IKne3meq5aSn9XLyUdCD")  # Charlie
 CALLSIGN     = SETTINGS.get("callsign", "")
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_turbo_v2_5")
@@ -56,6 +138,26 @@ def simbrief_summary():
         return f"(no live SimBrief plan: {e})"
 
 PLAN = simbrief_summary() if SIMBRIEF_ID else "(no SimBrief ID configured)"
+
+def current_airport():
+    """Return ICAO for the active airport: settings airport, else SimBrief origin."""
+    a = (SETTINGS.get("airport") or "").strip().upper()
+    if a:
+        return a
+    m = re.search(r"([A-Z]{4})", PLAN)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def atc_context_line():
+    """Build the airport+ATIS context string to inject into Gemini prompts."""
+    icao = current_airport()
+    if not icao:
+        return ""
+    ctx, _ = airport_context(icao)
+    return f"\nCURRENT AIRPORT CONTEXT:\n{ctx}"
+
 
 SYSTEM_PROMPT = f"""You are an AI air traffic controller at a US towered airport, speaking on VHF radio.
 You communicate in standard, concise ATC phraseology: callsign first, then the instruction, then frequency.
@@ -194,7 +296,7 @@ def gemini_reply(user_text):
     parts = []
     for h in HISTORY[-8:]:
         parts.append({"role": h["role"], "parts": [{"text": h["parts"][0]["text"]}]})
-    parts.append({"role": "user", "parts": [{"text": user_text}]})
+    parts.append({"role": "user", "parts": [{"text": user_text + atc_context_line()}]})
     parts.insert(0, {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]})
     parts.insert(1, {"role": "model", "parts": [{"text": "Understood. Standing by on frequency."}]})
     reply = gemini_call(parts)
@@ -222,7 +324,7 @@ def gemini_respond_audio(audio_bytes, mime="audio/wav"):
             except OSError: pass
     b64 = base64.b64encode(wav).decode()
     parts = [
-        {"text": "You are the ATC controller. Transcribe the pilot's radio transmission, then reply as a realistic ATC controller with proper phraseology. Use this format:\nTRANSCRIPT: <exact words>\nREPLY: <your ATC reply>"},
+        {"text": "You are the ATC controller. Transcribe the pilot's radio transmission, then reply as a realistic ATC controller with proper phraseology. Use this format:\nTRANSCRIPT: <exact words>\nREPLY: <your ATC reply>" + atc_context_line()},
         {"inline_data": {"mime_type": "audio/wav", "data": b64}}
     ]
     return gemini_call([{"role": "user", "parts": parts}], model=GEMINI_LITE)
@@ -326,7 +428,8 @@ async def api_settings(request):
     if request.method == "GET":
         return JSONResponse({"simbrief_id": SETTINGS.get("simbrief_id", ""),
                             "callsign": SETTINGS.get("callsign", ""),
-                            "voice": SETTINGS.get("voice", "")})
+                            "voice": SETTINGS.get("voice", ""),
+                            "airport": SETTINGS.get("airport", "")})
     body = await request.json()
     if "simbrief_id" in body:
         SETTINGS["simbrief_id"] = str(body["simbrief_id"]).strip()
@@ -334,13 +437,97 @@ async def api_settings(request):
         SETTINGS["callsign"] = str(body["callsign"]).strip()
     if "voice" in body:
         SETTINGS["voice"] = str(body["voice"]).strip()
+    if "airport" in body:
+        SETTINGS["airport"] = str(body["airport"]).strip().upper()
     save_settings(SETTINGS)
     return JSONResponse({"ok": True, "settings": SETTINGS})
+
+async def api_airports(request):
+    """Search airports by ICAO/name/city. Returns compact list."""
+    q = (request.query_params.get("q") or "").strip().upper()
+    if not q:
+        return JSONResponse({"airports": []})
+    out = []
+    for icao, a in APTS.items():
+        if q in icao or q in (a.get("n") or "").upper() or q in (a.get("m") or "").upper():
+            out.append({"icao": icao, "name": a.get("n"), "city": a.get("m"), "country": a.get("c"),
+                        "freqs": a.get("f", {})})
+            if len(out) >= 12:
+                break
+    return JSONResponse({"airports": out})
+
+
+async def api_frequencies(request):
+    icao = (request.path_params["icao"] or "").upper()
+    a = APTS.get(icao)
+    if not a:
+        return JSONResponse({"error": "airport not found"}, status_code=404)
+    return JSONResponse({"icao": icao, "freqs": a.get("f", {}), "runways": a.get("r", [])})
+
+
+async def api_atis(request):
+    """Real ATIS from live METAR + airport data."""
+    icao = (request.path_params["icao"] or "").upper()
+    a = APTS.get(icao)
+    if not a:
+        return JSONResponse({"error": "airport not found"}, status_code=404)
+    metar = fetch_metar(icao)
+    if not metar or not metar.get("raw"):
+        return JSONResponse({"error": "no metar", "icao": icao}, status_code=404)
+    wdir = metar.get("wind_dir") or 0
+    wspd = metar.get("wind_spd") or 0
+    wgst = metar.get("wind_gust")
+    act = active_runways(a, wdir)
+    # Build realistic ATIS text (letter starts at A per session)
+    letter = chr(65 + (_ATIS_ROLL.get(icao, 0) % 26))
+    _ATIS_ROLL[icao] = _ATIS_ROLL.get(icao, 0) + 1
+    wind_str = f"wind {wdir:03d} at {wspd}" + (f" gusting {wgst}" if wgst else "")
+    alt = metar.get("altim")
+    # aviationweather.gov returns altim in hPa; ATIS speaks inHg (29.92)
+    try:
+        alt_inhg = float(alt) / 33.8639
+        alt_str = f"altimeter {alt_inhg:.2f}"
+    except (TypeError, ValueError):
+        alt_str = "altimeter missing"
+    ceil = metar.get("ceil")
+    vis = metar.get("visib")
+    _v = str(vis or "")
+    if _v.endswith("+"):
+        vis_str = f"visibility {_v[:-1]} or greater sm"
+    else:
+        vis_str = f"visibility {_v} sm" if vis else "visibility missing"
+    parts = [
+        f"THIS IS {icao} ATIS INFORMATION {letter}",
+        f"DEPARTURE RUNWAY {act[0] if act else 'XX'}.",
+        wind_str.upper(),
+        vis_str.upper(),
+        (f"CEILING {ceil} HUNDRED" if ceil else "CAVU"),
+        alt_str,
+    ]
+    atis_text = " ".join(parts)
+    audio_url = None
+    try:
+        mp3 = eleven_speak(atis_text)
+        wav = mp3.with_suffix(".wav")
+        import subprocess
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3), "-ar", "44100", "-ac", "1", str(wav)], check=True)
+        pcm = load_wav_bytes(wav.read_bytes())
+        fx = encode_wav(radio_fx(pcm, 44100))
+        out = BASE / "audio" / f"{uuid.uuid4().hex}.wav"
+        out.write_bytes(fx)
+        audio_url = f"/audio/{out.name}"
+    except Exception:
+        audio_url = None
+    return JSONResponse({"icao": icao, "atis": atis_text, "metar": metar.get("raw"), "audio": audio_url})
+
 
 routes = [
     Route("/", index),
     Route("/api/chat", api_chat, methods=["POST"]),
     Route("/api/settings", api_settings, methods=["GET", "POST"]),
+    Route("/api/airports", api_airports),
+    Route("/api/frequencies/{icao}", api_frequencies),
+    Route("/api/atis/{icao}", api_atis),
     Route("/audio/{name}", audio),
     Mount("/static", StaticFiles(directory=str(BASE / "static"))),
 ]

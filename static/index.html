@@ -14,6 +14,19 @@ header { display:flex; align-items:center; justify-content:space-between; paddin
 .brand span { color:var(--accent); }
 .freq { font-variant-numeric:tabular-nums; color:var(--dim); font-size:13px; }
 .freq b { color:var(--txt); font-weight:600; }
+.airportbar { display:flex; flex-direction:column; gap:8px; padding:10px 16px; border-bottom:1px solid var(--edge); background:var(--panel); }
+.aprow { position:relative; display:flex; }
+.aprow input { width:100%; background:var(--bg); color:var(--txt); border:1px solid var(--edge); border-radius:8px; padding:9px 12px; font-size:14px; }
+#apresults { position:absolute; top:100%; left:0; right:0; background:var(--panel); border:1px solid var(--edge); border-radius:0 0 10px 10px; z-index:30; max-height:220px; overflow-y:auto; display:none; }
+#apresults.open { display:block; }
+#apresults .ap { padding:9px 12px; font-size:13px; cursor:pointer; border-bottom:1px solid var(--edge); display:flex; justify-content:space-between; gap:8px; }
+#apresults .ap:last-child { border-bottom:none; }
+#apresults .ap b { color:var(--accent); }
+#apresults .ap:hover { background:#1a2230; }
+.freqrow { display:flex; flex-wrap:wrap; gap:6px; }
+.freqrow .fbt { background:var(--bg); color:var(--dim); border:1px solid var(--edge); border-radius:20px; padding:6px 12px; font-size:12.5px; font-weight:600; cursor:pointer; font-variant-numeric:tabular-nums; }
+.freqrow .fbt.active { background:var(--accent); color:#081c14; border-color:var(--accent); }
+.freqrow .fbt .type { font-weight:700; margin-right:5px; }
 .gear { background:var(--panel); border:1px solid var(--edge); color:var(--txt); border-radius:8px; padding:4px 10px; font-size:15px; cursor:pointer; margin-left:10px; }
 .settings { display:none; position:fixed; top:60px; right:16px; width:min(320px,90vw); background:var(--panel); border:1px solid var(--edge); border-radius:12px; padding:18px; z-index:20; box-shadow:0 20px 60px rgba(0,0,0,.5); }
 .settings.open { display:block; }
@@ -46,7 +59,14 @@ footer { padding:10px 18px; border-top:1px solid var(--edge); color:var(--dim); 
 </style>
 </head>
 <body>
-<header><div class="brand">Aero<span>Speak</span> ATC</div><div class="right"><span class="freq">FREQ <b id="freq">133.20</b></span><button class="gear" id="gear" title="Settings">⚙</button></div></header>
+<header><div class="brand">Aero<span>Speak</span> ATC</div><div class="right"><span class="freq" id="freqBadge"></span><button class="gear" id="gear" title="Settings">⚙</button></div></header>
+<div class="airportbar" id="airportbar">
+  <div class="aprow">
+    <input id="apsearch" type="search" placeholder="Search airport (ICAO or name)" autocomplete="off">
+    <div id="apresults"></div>
+  </div>
+  <div class="freqrow" id="freqrow"></div>
+</div>
 <div class="settings" id="settings">
   <h3>Settings</h3>
   <label>SimBrief Pilot ID
