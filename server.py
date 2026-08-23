@@ -36,7 +36,6 @@ ATC_VOICE    = SETTINGS.get("voice") or os.environ.get("ATC_VOICE", "IKne3meq5aS
 
 GEMINI_KEY   = os.environ.get("GEMINI_KEY", "")
 ELEVEN_KEY   = os.environ.get("ELEVEN_KEY", "")
-PLAN = simbrief_summary() if SIMBRIEF_ID else "(no SimBrief ID configured)"
 
 # ---------------------------------------------------------------- airport data
 # Packed OurAirports dataset (US/CA/global medium+large airports, runways)
