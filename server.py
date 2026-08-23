@@ -6,6 +6,7 @@ Charlie (ElevenLabs) speaks with VHF radio degradation."""
 import io, json, os, re, uuid, wave
 from pathlib import Path
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 import numpy as np
 from scipy.signal import butter, sosfiltfilt, lfilter
@@ -133,16 +134,36 @@ def radio_fx(pcm, sr):
     return mix
 
 # ---------------------------------------------------------------- gemini
-def gemini_call(contents):
-    """Send a full contents array (list of {role, parts}) to Gemini and return text."""
-    payload = json.dumps({"contents": contents}).encode()
-    req = Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        data=payload, headers={"Content-Type": "application/json",
-                               "x-goog-api-key": GEMINI_KEY})
-    with urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode())
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+def gemini_call(contents, retries=3):
+    """Send a full contents array (list of {role, parts}) to Gemini and return text.
+    Retries transient 429/503 errors (free tier is flaky) and returns a safe
+    fallback instead of crashing on filtered/empty responses."""
+    import time
+    last_err = None
+    for attempt in range(retries):
+        payload = json.dumps({"contents": contents}).encode()
+        req = Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            data=payload, headers={"Content-Type": "application/json",
+                                   "x-goog-api-key": GEMINI_KEY})
+        try:
+            with urlopen(req, timeout=45) as r:
+                data = json.loads(r.read().decode())
+            try:
+                txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                if txt:
+                    return txt
+            except (KeyError, IndexError, TypeError):
+                pass  # empty/filtered response -> fall through to retry
+            last_err = "empty response"
+        except HTTPError as e:
+            last_err = f"HTTP {e.code}"
+            if e.code not in (429, 500, 502, 503):
+                raise
+        except Exception as e:
+            last_err = repr(e)
+        time.sleep(1.5 * (attempt + 1))
+    return "Say again?"  # safe fallback
 
 def gemini_transcribe(audio_bytes, mime):
     """Transcribe pilot's transmission. Convert any input to 16k mono WAV first
