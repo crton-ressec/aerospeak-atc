@@ -198,6 +198,31 @@ def gemini_reply(user_text):
     HISTORY.append({"role": "model", "parts": [{"text": reply}]})
     return reply
 
+def gemini_respond_audio(audio_bytes, mime="audio/wav"):
+    """One-call path: transcribe the audio AND reply as ATC in a single
+    generateContent request. Halves free-tier quota usage (2 calls -> 1) and
+    removes the fragile 'Say again?' intermediate."""
+    import base64, subprocess, tempfile
+    import imageio_ffmpeg
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.NamedTemporaryFile(suffix=".in", delete=False) as tf:
+        tf.write(audio_bytes); tin = tf.name
+    tout = tin + ".wav"
+    try:
+        subprocess.run([ff, "-y", "-loglevel", "error", "-i", tin,
+                        "-ar", "16000", "-ac", "1", tout], check=True)
+        wav = open(tout, "rb").read()
+    finally:
+        for p in (tin, tout):
+            try: os.remove(p)
+            except OSError: pass
+    b64 = base64.b64encode(wav).decode()
+    parts = [
+        {"text": "You are the ATC controller. Transcribe the pilot's radio transmission, then reply as a realistic ATC controller with proper phraseology. Use this format:\nTRANSCRIPT: <exact words>\nREPLY: <your ATC reply>"},
+        {"inline_data": {"mime_type": "audio/wav", "data": b64}}
+    ]
+    return gemini_call([{"role": "user", "parts": parts}])
+
 # ---------------------------------------------------------------- eleven
 def eleven_speak(text):
     payload = json.dumps({
@@ -222,27 +247,54 @@ async def index(request):
 async def api_chat(request):
     import base64
     ctype = request.headers.get("content-type", "")
+    raw_text = None
+    audio_bytes = None
+    mime = None
     if ctype.startswith("multipart/form-data"):
         form = await request.form()
         upload = form.get("audio")
-        if upload is None:
+        txt_field = (form.get("text") or "").strip()
+        if upload is not None:
+            audio_bytes = await upload.read()
+            mime = upload.content_type or "audio/webm"
+        elif txt_field:
+            raw_text = txt_field
+        if audio_bytes is None and raw_text is None:
             return JSONResponse({"error": "no audio field"}, status_code=400)
-        audio_bytes = await upload.read()
-        mime = upload.content_type or "audio/webm"
-        try:
-            text = gemini_transcribe(audio_bytes, mime)
-        except Exception as e:
-            return JSONResponse({"error": f"transcribe: {e}"}, status_code=502)
     else:
         body = await request.json()
-        text = (body.get("text") or "").strip()
-        if not text:
-            return JSONResponse({"error": "empty"}, status_code=400)
+        raw_text = (body.get("text") or "").strip()
 
-    try:
-        reply = gemini_reply(text)
-    except Exception as e:
-        return JSONResponse({"error": f"Gemini: {e}"}, status_code=502)
+    if audio_bytes is not None:
+        # One-call path: transcribe + reply in a single Gemini request.
+        try:
+            combined = gemini_respond_audio(audio_bytes, mime)
+        except Exception as e:
+            return JSONResponse({"error": "transcribe_failed", "detail": str(e)}, status_code=502)
+        if not combined or "say again" in combined.lower()[:80]:
+            return JSONResponse({"error": "transcribe_failed", "detail": "empty capture"}, status_code=502)
+        # Parse the TRANSCRIPT / REPLY block
+        text = combined
+        reply = combined
+        m = re.search(r"REPLY:\s*(.+)", combined, re.S | re.I)
+        if m:
+            reply = m.group(1).strip()
+        m = re.search(r"TRANSCRIPT:\s*(.+?)(?:\nREPLY:|$)", combined, re.S | re.I)
+        if m:
+            text = m.group(1).strip()
+        if not reply or reply.lower() == "say again?":
+            return JSONResponse({"error": "brain_unavailable", "detail": "empty reply"}, status_code=502)
+    else:
+        raw_text = raw_text or ""
+        if not raw_text:
+            return JSONResponse({"error": "empty"}, status_code=400)
+        try:
+            reply = gemini_reply(raw_text)
+        except Exception as e:
+            return JSONResponse({"error": "brain_unavailable", "detail": str(e)}, status_code=502)
+        if not reply or reply.lower() == "say again?":
+            return JSONResponse({"error": "brain_unavailable", "detail": "empty reply"}, status_code=502)
+        text = raw_text
 
     try:
         mp3 = eleven_speak(reply)
@@ -254,7 +306,8 @@ async def api_chat(request):
         out = BASE / "audio" / f"{uuid.uuid4().hex}.wav"
         out.write_bytes(fx)
     except Exception as e:
-        return JSONResponse({"error": f"TTS: {e}", "text": reply}, status_code=502)
+        # TTS failed (quota/network): still show the reply text, no audio.
+        return JSONResponse({"text": reply, "audio": None})
 
     return JSONResponse({"text": reply, "audio": f"/audio/{out.name}"})
 

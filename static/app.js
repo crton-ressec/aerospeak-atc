@@ -59,6 +59,17 @@
     if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
   }
 
+  // Unlock iOS audio on first user gesture (PTT pointerdown).
+  let audioUnlocked = false;
+  function unlockAudio() {
+    if (audioUnlocked) return;
+    try {
+      const silent = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
+      silent.play().then(() => { silent.pause(); }).catch(() => {});
+      audioUnlocked = true;
+    } catch (e) {}
+  }
+
   async function sendAudio(blob) {
     const fd = new FormData(); fd.append('audio', blob, 'tx.wav');
     if (callsign.value.trim()) fd.append('callsign', callsign.value.trim());
@@ -66,18 +77,30 @@
     try {
       const resp = await fetch('/api/chat', { method: 'POST', body: fd });
       const data = await resp.json();
-      if (!resp.ok) { log('sys', 'Error: ' + (data.error || resp.status)); setState('error'); return; }
+      if (!resp.ok) {
+        if (data.error === 'transcribe_failed') {
+          log('sys', "Didn't catch you — press and hold & speak again.");
+        } else if (data.error === 'brain_unavailable') {
+          log('sys', 'ATC brain glitched — try again.');
+        } else {
+          log('sys', 'Error: ' + (data.error || resp.status));
+        }
+        setState('error'); setTimeout(() => setState('ready'), 1500);
+        return;
+      }
       log('atc', data.text || '');
-      playAudio(data.audio); setState('ready');
-    } catch (e) { log('sys', 'Network error: ' + e.message); setState('error'); }
+      if (data.audio) playAudio(data.audio);
+      setState('ready');
+    } catch (e) { log('sys', 'Network error: ' + e.message); setState('error'); setTimeout(() => setState('ready'), 1500); }
   }
 
   function playAudio(url) {
-    const audio = new Audio(url);
+    const abs = url.startsWith('http') ? url : location.origin + url;
+    const audio = new Audio(abs);
     audio.play().catch(() => log('sys', 'Tap to enable audio'));
   }
 
-  ptt.addEventListener('pointerdown', e => { e.preventDefault(); startRecording(); });
+  ptt.addEventListener('pointerdown', e => { e.preventDefault(); unlockAudio(); startRecording(); });
 
   // ---- settings panel ----
   async function loadSettings() {
