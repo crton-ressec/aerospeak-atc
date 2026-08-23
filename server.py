@@ -133,8 +133,9 @@ def radio_fx(pcm, sr):
     return mix
 
 # ---------------------------------------------------------------- gemini
-def gemini_call(parts):
-    payload = json.dumps({"contents": parts}).encode()
+def gemini_call(contents):
+    """Send a full contents array (list of {role, parts}) to Gemini and return text."""
+    payload = json.dumps({"contents": contents}).encode()
     req = Request(
         f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
         data=payload, headers={"Content-Type": "application/json",
@@ -162,7 +163,7 @@ def gemini_transcribe(audio_bytes, mime):
             except OSError: pass
     parts = [{"text": "Transcribe the pilot's radio transmission verbatim. Output only the spoken words."},
              {"inline_data": {"mime_type": "audio/wav", "data": base64.b64encode(wav).decode()}}]
-    return gemini_call(parts)
+    return gemini_call([{"role": "user", "parts": parts}])
 
 def gemini_reply(user_text):
     parts = []
