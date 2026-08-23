@@ -37,6 +37,8 @@ VOICE_ID     = SETTINGS.get("voice") or os.environ.get("ATC_VOICE", "IKne3meq5aS
 CALLSIGN     = SETTINGS.get("callsign", "")
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_turbo_v2_5")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+# Lightweight model for audio one-call (separate free-tier quota pool, ~1s).
+GEMINI_LITE = os.environ.get("GEMINI_LITE", "gemini-flash-lite-latest")
 
 def simbrief_summary():
     try:
@@ -134,16 +136,18 @@ def radio_fx(pcm, sr):
     return mix
 
 # ---------------------------------------------------------------- gemini
-def gemini_call(contents, retries=3):
+def gemini_call(contents, model=None, retries=3):
     """Send a full contents array (list of {role, parts}) to Gemini and return text.
-    Retries transient 429/503 errors (free tier is flaky) and returns a safe
-    fallback instead of crashing on filtered/empty responses."""
+    Uses GEMINI_MODEL by default, or an explicit model. Retries transient 429/503
+    errors (free tier is flaky) and returns a safe fallback instead of crashing
+    on filtered/empty responses."""
     import time
+    model = model or GEMINI_MODEL
     last_err = None
     for attempt in range(retries):
         payload = json.dumps({"contents": contents}).encode()
         req = Request(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             data=payload, headers={"Content-Type": "application/json",
                                    "x-goog-api-key": GEMINI_KEY})
         try:
@@ -221,7 +225,7 @@ def gemini_respond_audio(audio_bytes, mime="audio/wav"):
         {"text": "You are the ATC controller. Transcribe the pilot's radio transmission, then reply as a realistic ATC controller with proper phraseology. Use this format:\nTRANSCRIPT: <exact words>\nREPLY: <your ATC reply>"},
         {"inline_data": {"mime_type": "audio/wav", "data": b64}}
     ]
-    return gemini_call([{"role": "user", "parts": parts}])
+    return gemini_call([{"role": "user", "parts": parts}], model=GEMINI_LITE)
 
 # ---------------------------------------------------------------- eleven
 def eleven_speak(text):
