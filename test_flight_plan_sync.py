@@ -59,12 +59,12 @@ def test_selected_controller_frequency_context():
     assert "taxi" in context.lower()
 
 
-def test_nonradar_guard_rewrites_radar_language():
+def test_nonradar_restriction_is_in_gemini_context():
     state = server._blank_state()
     state["settings"]["controller_type"] = "APP"
-    reply = server.enforce_nonradar_reply("Radar contact. Fly heading zero niner zero.", state)
-    assert "Negative radar service" in reply
-    assert "radar contact" not in reply.lower()
+    prompt = server.system_prompt(state)
+    assert "never claim radar contact" in prompt.lower()
+    assert "never claim radar contact" in server.CONTROLLER_PROFILES["APP"]["scope"].lower()
 
 
 def test_browser_sessions_are_isolated():
@@ -111,26 +111,26 @@ def test_voice_only_boundary_rejects_json():
     assert response.status_code == 415
 
 
-def test_operational_ifr_clearance_and_readback():
+def test_operational_clearance_reply_remains_gemini_owned():
     state = server._blank_state()
     state["settings"].update({"controller_type": "CLD", "callsign": "AAL100"})
     state["flight_plan"] = {"callsign": "AAL100", "origin": "KJFK", "destination": "KLAX", "cruise_altitude": "35000"}
-    reply = server.clearance_delivery_reply("American 100 at gate B12 IFR to Los Angeles request clearance", state)
-    assert "cleared to KLAX airport as filed" in reply
-    assert state["operation"]["phase"] == "CLEARANCE"
+    gemini_reply = "AAL100, cleared to Los Angeles airport as filed, maintain flight level three five zero."
+    with patch.object(server, "gemini_call", return_value=gemini_reply):
+        reply = server.gemini_controller_reply("American 100 at gate B12 IFR to Los Angeles request clearance", state)
+    assert reply == gemini_reply
     server.register_pending_readback(reply, state)
     assert state["operation"]["pending_readback"]
-    assert "read back" in server.readback_correction("roger", state).lower()
-    assert server.readback_correction("AAL100 cleared to KLAX airport maintain 35000", state) == ""
 
 
-def test_emergency_transitions_to_priority_operation():
+def test_emergency_state_does_not_replace_gemini_reply():
     state = server._blank_state()
     state["settings"]["callsign"] = "EUROPEAIR447"
-    reply = server.emergency_reply("Mayday EuropeAir 447 engine fire", state)
-    assert "roger emergency" in reply.lower()
+    gemini_reply = "EUROPEAIR447, roger Mayday. State nature of emergency and intentions."
+    server.transition_from_transcript("Mayday EuropeAir 447 engine fire", state)
     assert state["operation"]["phase"] == "EMERGENCY"
     assert state["operation"]["emergency"] is True
+    assert gemini_reply.startswith("EUROPEAIR447, roger Mayday")
 
 
 def test_operation_context_never_claims_telemetry():
@@ -151,13 +151,13 @@ def test_line_up_and_wait_does_not_become_takeoff_clearance():
 if __name__ == "__main__":
     test_context_injection()
     test_selected_controller_frequency_context()
-    test_nonradar_guard_rewrites_radar_language()
+    test_nonradar_restriction_is_in_gemini_context()
     test_browser_sessions_are_isolated()
     test_rate_limit_blocks_excess_requests()
     test_optional_access_gate()
     test_voice_only_boundary_rejects_json()
-    test_operational_ifr_clearance_and_readback()
-    test_emergency_transitions_to_priority_operation()
+    test_operational_clearance_reply_remains_gemini_owned()
+    test_emergency_state_does_not_replace_gemini_reply()
     test_operation_context_never_claims_telemetry()
     test_line_up_and_wait_does_not_become_takeoff_clearance()
     print("AeroSpeak session, flight-plan, safety, voice-only, and operational-flow tests passed")

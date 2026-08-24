@@ -591,7 +591,7 @@ def system_prompt(state):
 You are the exact airport controller selected by the pilot in Settings, speaking concise standard US VHF phraseology. Never describe yourself as a menu-based simulator system.
 Stay strictly within the selected controller's role. If the pilot calls the wrong station, state the correct station and frequency only when that frequency is supplied in the active airport data. If no active station is selected, ask the pilot to select an airport and controller in Settings.
 For departure operations, handle ATIS, IFR clearance, pushback/engine-start coordination, taxi, hold short, line up and wait, takeoff, and departure handoff only within the selected station role. For arrival operations, handle procedural non-radar position reporting, destination ATIS, landing, runway exit, and taxi to parking only within the selected station role.
-For Ground, interpret each request independently: an engine-start or startup request requires engine-start approval; a pushback request requires pushback approval; a taxi request requires a taxi response. Never answer a startup or pushback request with a taxi, route, or generic flight-plan message. Never tell the pilot merely to follow a flight plan; use the synchronized plan only as context for runway, stand, and clearance details.
+Every live pilot transmission must be transcribed and answered by you, Gemini; no deterministic controller template will replace your reply. For Ground, interpret each request independently: an engine-start or startup request requires engine-start approval; a pushback request requires pushback approval; a taxi request requires a taxi response. Never answer a startup or pushback request with a taxi, route, or generic flight-plan message. Never tell the pilot merely to follow a flight plan; use the synchronized plan only as context for runway, stand, and clearance details.
 A line-up-and-wait instruction is not takeoff clearance. Hold-short, line-up-and-wait, takeoff, and landing instructions require an explicit pilot readback when the session marks one as pending. If the pilot declares an emergency, acknowledge priority and request only the emergency facts you need.
 Never invent an airport, gate, runway, frequency, route, weather report, clearance, charted procedure, traffic, or simulator state. You do not have aircraft telemetry; rely on the pilot's spoken position, altitude, runway status, and flight phase. Keep each reply under 45 words.
 Read numbers as spoken ATC (for example, 'two five zero' and 'squawk one two three four').
@@ -702,7 +702,8 @@ def gemini_call(contents, model=None, retries=3):
     return "Say again?"
 
 
-def gemini_respond_audio(audio_bytes, state):
+def gemini_transcribe_audio(audio_bytes):
+    """Use Gemini to transcribe the pilot audio; it does not issue a controller reply here."""
     with tempfile.NamedTemporaryFile(suffix=".input", delete=False) as source:
         source.write(audio_bytes)
         source_path = Path(source.name)
@@ -717,6 +718,18 @@ def gemini_respond_audio(audio_bytes, state):
     finally:
         source_path.unlink(missing_ok=True)
         wav_path.unlink(missing_ok=True)
+    contents = [{
+        "role": "user",
+        "parts": [
+            {"text": "Transcribe this pilot radio transmission exactly. Return only the spoken words; do not answer it, summarize it, or add labels."},
+            {"inline_data": {"mime_type": "audio/wav", "data": base64.b64encode(wav_bytes).decode()}},
+        ],
+    }]
+    return gemini_call(contents, model=GEMINI_LITE).strip()
+
+
+def gemini_controller_reply(transcript, state, route_context=""):
+    """Use Gemini to make the controller decision for every transcribed radio call."""
     contents = [
         {"role": "user", "parts": [{"text": system_prompt(state)}]},
         {"role": "model", "parts": [{"text": "Understood. Standing by on frequency."}]},
@@ -725,12 +738,11 @@ def gemini_respond_audio(audio_bytes, state):
         contents.append({"role": turn["role"], "parts": [{"text": turn["text"]}]})
     contents.append({
         "role": "user",
-        "parts": [
-            {"text": "Transcribe the pilot's radio transmission, then reply as the controller. Use exactly this format:\nTRANSCRIPT: <exact words>\nREPLY: <your ATC reply>"},
-            {"inline_data": {"mime_type": "audio/wav", "data": base64.b64encode(wav_bytes).decode()}},
-        ],
+        "parts": [{"text": f"PILOT RADIO TRANSCRIPT:\n{transcript}\n{route_context}\n\nIssue the complete concise controller response now. You are the only controller-response engine for this transmission. Follow the selected controller role and all operational restrictions in the system context. Return only the controller's radio response; do not return a transcript, analysis, label, or generic template."}],
     })
-    return gemini_call(contents, model=GEMINI_LITE)
+    raw_reply = gemini_call(contents, model=GEMINI_LITE).strip()
+    reply_match = re.search(r"REPLY:\s*(.+)", raw_reply, re.S | re.I)
+    return reply_match.group(1).strip() if reply_match else raw_reply
 
 
 def eleven_speak(text):
@@ -784,107 +796,37 @@ def parse_combined_reply(combined):
     return transcript, reply
 
 
-def _spoken_callsign(state):
-    return state.get("flight_plan", {}).get("callsign") or state["settings"].get("callsign") or "Aircraft"
-
-
-def _taxi_request_fields(transcript, state):
-    text = (transcript or "").upper()
-    runway_match = re.search(r"\bRUNWAY\s+(\d{1,2}[LRC]?)\b", text)
-    stand_match = re.search(r"\b(?:PARKING\s+(?:STAND|SPOT)\s+|PARKING\s+|STAND\s+|GATE\s+)([A-Z]?\d+[A-Z]?)\b", text)
-    runway = runway_match.group(1) if runway_match else ""
-    stand = stand_match.group(1) if stand_match else state["settings"].get("gate", "")
-    return stand, runway
-
-
-def ground_intent(transcript):
-    """Return a narrow operational intent only when the pilot's words make it unambiguous."""
-    text = (transcript or "").upper()
-    if re.search(r"\b(?:STARTUP|START\s+UP|ENGINE\s+START|START\s+CLEARANCE)\b", text):
-        return "STARTUP"
-    if re.search(r"\bPUSH\s*BACK\b", text):
-        return "PUSHBACK"
-    if re.search(r"\b(?:REQUEST|READY\s+FOR|READY\s+TO)\s+TAXI\b", text):
-        return "TAXI"
-    return ""
-
-
-def ground_taxi_reply(transcript, state):
-    """Create a deterministic Ground response only for an explicit, verified Ground intent."""
+def ground_route_context(transcript, state):
+    """Supply verified routing facts to Gemini; this function never produces a controller reply."""
     if state["settings"].get("controller_type") != "GND":
         return ""
-    intent = ground_intent(transcript)
-    if not intent:
+    text = (transcript or "").upper()
+    if not re.search(r"\b(?:REQUEST|READY\s+FOR|READY\s+TO)\s+TAXI\b", text):
         return ""
-    callsign = _spoken_callsign(state)
-
-    if intent == "STARTUP":
-        transition_operation(state, "PUSHBACK", "Engine start approved; awaiting pilot pushback request.")
-        return f"{callsign}, engine start approved. Advise ready for pushback."
-
-    if intent == "PUSHBACK":
-        transition_operation(state, "PUSHBACK", "Pushback approved; advise ready to taxi when clear of the stand.")
-        return f"{callsign}, pushback approved. Advise ready to taxi."
-
+    runway_match = re.search(r"\bRUNWAY\s+(\d{1,2}[LRC]?)\b", text)
+    stand_match = re.search(r"\b(?:PARKING\s+(?:STAND|SPOT)\s+|PARKING\s+|STAND\s+|GATE\s+)([A-Z]?\d+[A-Z]?)\b", text)
     plan = state.get("flight_plan", {})
-    stand, spoken_runway = _taxi_request_fields(transcript, state)
-    runway = spoken_runway or plan.get("origin_runway", "")
-    stand = stand or plan.get("gate", "") or state["settings"].get("gate", "")
+    runway = runway_match.group(1) if runway_match else plan.get("origin_runway", "")
+    stand = stand_match.group(1) if stand_match else plan.get("gate", "") or state["settings"].get("gate", "")
     station = state.get("station_context", {})
     icao = station.get("icao") or state["settings"].get("airport", "")
     airport = APTS.get(icao, {})
-    if not stand or not runway:
-        return ""
-
+    if not icao or not stand or not runway:
+        return "\nGROUND ROUTE FACTS: No complete verified stand-to-runway route is available. Ask the pilot to confirm missing stand or runway details; do not invent a taxi path."
     route = route_from_stand_to_runway(icao, airport.get("lat"), airport.get("lon"), stand, runway)
     state["last_taxi_route"] = route
-    if not route.get("ok"):
-        plan_note = f" Your synchronized flight plan indicates runway {runway}." if plan.get("origin") else ""
-        return f"{callsign}, unable to issue a verified named taxi route.{plan_note} {route.get('reason')} Verify the airport diagram and advise ready to copy."
-    taxiways = ", ".join(route["taxiways"])
-    transition_operation(state, "HOLD_SHORT", "Verified Ground taxi route issued; hold-short readback required.")
-    return f"{callsign}, taxi to runway {route['runway']} via {taxiways}, hold short runway {route['runway']}."
+    if route.get("ok"):
+        return f"\nGROUND ROUTE FACTS: Verified route from {stand} to runway {route['runway']} is via {', '.join(route['taxiways'])}. Use these facts if issuing a taxi clearance."
+    return f"\nGROUND ROUTE FACTS: A verified named route is unavailable ({route.get('reason', 'route data unavailable')}). Do not invent a taxiway sequence."
 
 
-def _normalized(text):
-    return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
-
-
-def emergency_reply(transcript, state):
+def transition_from_transcript(transcript, state):
+    """Record critical pilot-reported state without altering Gemini's controller response."""
     text = (transcript or "").upper()
-    terms = ("MAYDAY", "PAN PAN", "EMERGENCY", "ENGINE FAILURE", "ENGINE FIRE", "SMOKE", "MEDICAL EMERGENCY")
-    if not any(term in text for term in terms):
-        return ""
-    callsign = _spoken_callsign(state)
-    transition_operation(state, "EMERGENCY", "Priority operation reported by pilot.", emergency=True)
-    state["operation"]["pending_readback"] = {}
-    return f"{callsign}, roger emergency. State nature of emergency, souls on board, fuel remaining, and intentions."
-
-
-def clearance_delivery_reply(transcript, state):
-    if state["settings"].get("controller_type") != "CLD":
-        return ""
-    text = (transcript or "").upper()
-    plan = state.get("flight_plan", {})
-    if not plan.get("destination") or not ("IFR" in text or "CLEARANCE" in text):
-        return ""
-    callsign = _spoken_callsign(state)
-    altitude = plan.get("cruise_altitude") or "filed altitude"
-    transition_operation(state, "CLEARANCE", "IFR clearance issued from synchronized flight plan.")
-    return f"{callsign}, cleared to {plan['destination']} airport as filed, maintain {altitude}. Advise ready to taxi."
-
-
-def readback_correction(transcript, state):
-    pending = state.get("operation", {}).get("pending_readback", {})
-    if not pending:
-        return ""
-    text = _normalized(transcript)
-    expected = [_normalized(item) for item in pending.get("required", []) if item]
-    if expected and all(item in text for item in expected):
-        state["operation"]["pending_readback"] = {}
-        return ""
-    callsign = _spoken_callsign(state)
-    return f"{callsign}, read back {pending.get('description', 'the instruction')}."
+    emergency_terms = ("MAYDAY", "PAN PAN", "EMERGENCY", "ENGINE FAILURE", "ENGINE FIRE", "SMOKE", "MEDICAL EMERGENCY")
+    if any(term in text for term in emergency_terms):
+        transition_operation(state, "EMERGENCY", "Priority operation reported by pilot.", emergency=True)
+        state.setdefault("operation", {})["pending_readback"] = {}
 
 
 def register_pending_readback(reply, state):
@@ -928,16 +870,6 @@ def transition_from_reply(reply, transcript, state):
         transition_operation(state, "DEPARTURE", "Procedural departure coordination active.")
     elif state.get("operation", {}).get("mode") == "ARRIVAL" and controller == "GND" and ("PARKING" in pilot or "AT THE GATE" in pilot):
         transition_operation(state, "PARKED", "Pilot reported parked.")
-
-
-def enforce_nonradar_reply(reply, state):
-    """Prevent departure and approach responses from contradicting the no-radar design."""
-    if state["settings"].get("controller_type") not in ("APP", "DEP"):
-        return reply
-    prohibited = ("radar contact", "radar identified", "radar service", "radar vector", "vectors", "vectoring", "fly heading")
-    if any(phrase in (reply or "").lower() for phrase in prohibited):
-        return "Negative radar service. Report your position, altitude, and destination ATIS, then stand by for procedural instructions."
-    return reply
 
 
 def plan_validation(plan):
@@ -1036,18 +968,21 @@ async def api_chat(request):
     refreshed = refresh_live_context(state)
     station_refreshed = bool(refresh_station_context(state))
     try:
-        combined = gemini_respond_audio(audio_bytes, state)
+        transcript = gemini_transcribe_audio(audio_bytes)
+        if not transcript or transcript.lower() == "say again?":
+            return session_response(request, {"error": "transcribe_failed", "detail": "Gemini could not produce a usable radio transcript."}, 502)
+        route_context = ground_route_context(transcript, state)
+        reply = gemini_controller_reply(transcript, state, route_context)
     except AudioLimitError as error:
         return session_response(request, {"error": "audio_too_long", "detail": str(error)}, 413)
     except Exception as error:
         return session_response(request, {"error": "transcribe_failed", "detail": str(error)}, 502)
-    transcript, reply = parse_combined_reply(combined)
-    safety_reply = emergency_reply(transcript, state) or readback_correction(transcript, state)
-    deterministic_reply = clearance_delivery_reply(transcript, state) or ground_taxi_reply(transcript, state)
-    reply_source = "safety" if safety_reply else ("verified_controller_rule" if deterministic_reply else "gemini")
-    reply = safety_reply or deterministic_reply or enforce_nonradar_reply(reply, state)
+    # Gemini is the authoritative controller for every live radio transmission.
+    # Operational state is recorded from Gemini's reply; it never replaces it.
+    reply_source = "gemini_two_stage"
     if not reply or reply.lower() == "say again?":
         return session_response(request, {"error": "brain_unavailable", "detail": "ATC could not form a usable reply."}, 502)
+    transition_from_transcript(transcript, state)
     transition_from_reply(reply, transcript, state)
     register_pending_readback(reply, state)
     state["history"].extend([{"role": "user", "text": transcript}, {"role": "model", "text": reply}])
