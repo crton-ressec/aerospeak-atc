@@ -26,6 +26,7 @@ from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+import auth_store
 from taxi_router import route_from_stand_to_runway
 
 BASE = Path(__file__).parent
@@ -40,6 +41,7 @@ ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_turbo_v2_5")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_LITE = os.environ.get("GEMINI_LITE", "gemini-flash-lite-latest")
 ACCESS_CODE = os.environ.get("AEROSPEAK_ACCESS_CODE", "").strip()
+AUTH_COOKIE = "aerospeak_auth"
 SIMBRIEF_URL = "https://www.simbrief.com/api/xml.fetcher.php"
 METAR_URL = "https://aviationweather.gov/api/data/metar?ids={icao}&format=json&taf=false&hours=1"
 
@@ -88,6 +90,26 @@ except Exception:
 _SESSIONS: dict[str, dict] = {}
 _SESSION_LOCK = threading.RLock()
 _RATE_WINDOWS: dict[tuple[str, str], deque] = defaultdict(deque)
+_DATABASE_READY = False
+_DATABASE_LOCK = threading.RLock()
+
+
+def ensure_database():
+    """Initialize account tables on first use without relying on framework startup hooks."""
+    global _DATABASE_READY
+    if not auth_store.configured() or _DATABASE_READY:
+        return True
+    with _DATABASE_LOCK:
+        if _DATABASE_READY:
+            return True
+        try:
+            auth_store.initialize()
+            _DATABASE_READY = True
+            log_event("account_database_ready")
+            return True
+        except Exception as error:
+            log_event("account_database_init_failed", detail=str(error)[:120])
+            return False
 
 
 def log_event(event, **fields):
@@ -130,17 +152,50 @@ def _valid_session_id(value):
     return bool(value and re.fullmatch(r"[A-Za-z0-9_-]{20,80}", value))
 
 
+def user_for_request(request):
+    """Resolve a persistent account from the opaque, HTTP-only browser cookie."""
+    if hasattr(request.state, "aerospeak_user"):
+        return request.state.aerospeak_user
+    user = None
+    if auth_store.configured() and ensure_database():
+        try:
+            user = auth_store.user_for_session(request.cookies.get(AUTH_COOKIE, ""))
+        except Exception as error:
+            log_event("auth_lookup_failed", detail=str(error)[:120])
+    request.state.aerospeak_user = user
+    return user
+
+
+def _state_from_account(saved):
+    state = _blank_state()
+    if not isinstance(saved, dict):
+        return state
+    for key in ("settings", "flight_plan", "station_context", "last_taxi_route", "history", "atis_roll", "operation", "last_context_refresh", "authorized"):
+        if key in saved and isinstance(saved[key], type(state.get(key))):
+            state[key] = saved[key]
+    state["operation"] = {**_blank_state()["operation"], **(state.get("operation") or {})}
+    return state
+
+
 def session_for(request):
-    """Return a browser-scoped radio session without persisting pilot data to disk."""
+    """Return an account-scoped session when logged in, otherwise an ephemeral browser session."""
     if hasattr(request.state, "aerospeak_session"):
         return request.state.aerospeak_session
-    session_id = request.cookies.get("aerospeak_session")
-    new_session = not _valid_session_id(session_id)
-    if new_session:
-        session_id = secrets.token_urlsafe(24)
+    user = user_for_request(request)
+    if user:
+        session_id = f"account-{user['id']}"
+        new_session = False
+    else:
+        session_id = request.cookies.get("aerospeak_session")
+        new_session = not _valid_session_id(session_id)
+        if new_session:
+            session_id = secrets.token_urlsafe(24)
     with _SESSION_LOCK:
         _cleanup_sessions()
-        state = _SESSIONS.setdefault(session_id, _blank_state())
+        if session_id not in _SESSIONS:
+            saved = auth_store.load_state(user["id"]) if user else {}
+            _SESSIONS[session_id] = _state_from_account(saved) if user else _blank_state()
+        state = _SESSIONS[session_id]
         state["last_seen"] = time.time()
     request.state.aerospeak_session = state
     request.state.aerospeak_session_id = session_id
@@ -149,16 +204,23 @@ def session_for(request):
 
 
 def session_response(request, payload, status_code=200):
+    user = user_for_request(request)
+    state = getattr(request.state, "aerospeak_session", None)
+    if user and state and auth_store.configured():
+        try:
+            auth_store.save_state(user["id"], state)
+        except Exception as error:
+            log_event("account_state_save_failed", user_id=user["id"], detail=str(error)[:120])
     response = JSONResponse(payload, status_code=status_code)
     if getattr(request.state, "aerospeak_new_session", False):
-        response.set_cookie(
-            "aerospeak_session",
-            request.state.aerospeak_session_id,
-            max_age=SESSION_TTL_SECONDS,
-            httponly=True,
-            samesite="lax",
-            secure=bool(os.environ.get("RENDER")),
-        )
+        response.set_cookie("aerospeak_session", request.state.aerospeak_session_id, max_age=SESSION_TTL_SECONDS, httponly=True, samesite="lax", secure=bool(os.environ.get("RENDER")))
+    return response
+
+
+def auth_response(payload, token=None, status_code=200):
+    response = JSONResponse(payload, status_code=status_code)
+    if token:
+        response.set_cookie(AUTH_COOKIE, token, max_age=auth_store.SESSION_DAYS * 24 * 60 * 60, httponly=True, samesite="lax", secure=bool(os.environ.get("RENDER")))
     return response
 
 
@@ -169,6 +231,8 @@ def _cleanup_sessions():
 
 
 def require_access(request, state):
+    if auth_store.configured() and not user_for_request(request):
+        return session_response(request, {"error": "login_required", "detail": "Create an account or sign in before using live radio services."}, 401)
     if ACCESS_CODE and not state.get("authorized"):
         return session_response(request, {"error": "access_required", "detail": "Enter the access code in Settings before using live services."}, 403)
     return None
@@ -720,27 +784,41 @@ def _taxi_request_fields(transcript, state):
 
 
 def ground_taxi_reply(transcript, state):
-    """Create a deterministic Ground response only when route facts are available."""
+    """Create deterministic Ground responses only when the request and route facts are explicit."""
     if state["settings"].get("controller_type") != "GND":
         return ""
     text = (transcript or "").upper()
-    if "TAXI" not in text and "READY" not in text:
-        return ""
     callsign = _spoken_callsign(state)
+    operation = state.setdefault("operation", {})
+
+    if any(phrase in text for phrase in ("STARTUP", "START UP", "ENGINE START", "START CLEARANCE")):
+        transition_operation(state, "PUSHBACK", "Engine start approved; awaiting pilot pushback request.")
+        return f"{callsign}, engine start approved. Advise ready for pushback."
+
+    if "PUSHBACK" in text or "PUSH BACK" in text:
+        transition_operation(state, "PUSHBACK", "Pushback approved; awaiting pilot ready-to-taxi report.")
+        return f"{callsign}, pushback approved. Advise ready to taxi."
+
+    if "TAXI" not in text and "READY TO TAXI" not in text:
+        return ""
+
     plan = state.get("flight_plan", {})
-    if plan.get("origin"):
-        return f"{callsign}, please follow your flight plan. Advise ready to taxi."
-    stand, runway = _taxi_request_fields(transcript, state)
+    stand, spoken_runway = _taxi_request_fields(transcript, state)
+    runway = spoken_runway or plan.get("origin_runway", "")
+    stand = stand or plan.get("gate", "") or state["settings"].get("gate", "")
     station = state.get("station_context", {})
     icao = station.get("icao") or state["settings"].get("airport", "")
     airport = APTS.get(icao, {})
     if not stand or not runway:
         return ""
+
     route = route_from_stand_to_runway(icao, airport.get("lat"), airport.get("lon"), stand, runway)
     state["last_taxi_route"] = route
     if not route.get("ok"):
-        return f"{callsign}, unable to issue a verified taxi route. {route.get('reason')} Verify the airport diagram and advise ready to copy."
+        plan_note = f" Your synchronized flight plan indicates runway {runway}." if plan.get("origin") else ""
+        return f"{callsign}, unable to issue a verified named taxi route.{plan_note} {route.get('reason')} Verify the airport diagram and advise ready to copy."
     taxiways = ", ".join(route["taxiways"])
+    transition_operation(state, "HOLD_SHORT", "Verified Ground taxi route issued; hold-short readback required.")
     return f"{callsign}, taxi to runway {route['runway']} via {taxiways}, hold short runway {route['runway']}."
 
 
@@ -849,7 +927,67 @@ async def index(request):
 
 
 async def api_health(request):
-    return JSONResponse({"ok": True, "service": "aerospeak-atc", "sessions": len(_SESSIONS)})
+    return JSONResponse({"ok": True, "service": "aerospeak-atc", "sessions": len(_SESSIONS), "accounts_configured": auth_store.configured()})
+
+
+async def api_auth_status(request):
+    database_ready = ensure_database()
+    user = user_for_request(request)
+    return JSONResponse({
+        "configured": bool(auth_store.configured() and database_ready),
+        "authenticated": bool(user),
+        "user": {"email": user["email"]} if user else None,
+        "notice": auth_store.free_tier_notice() if auth_store.configured() else "Account storage will be available after PostgreSQL is connected.",
+    })
+
+
+async def api_auth_signup(request):
+    if not auth_store.configured() or not ensure_database():
+        return JSONResponse({"error": "accounts_unavailable", "detail": "Account storage is not configured yet."}, 503)
+    body = await request.json()
+    try:
+        user = auth_store.create_user(str(body.get("email") or ""), str(body.get("password") or ""))
+        token = auth_store.issue_session(user["id"])
+        state = _blank_state()
+        with _SESSION_LOCK:
+            _SESSIONS[f"account-{user['id']}"] = state
+        auth_store.save_state(user["id"], state)
+        log_event("account_created", user_id=user["id"])
+        return auth_response({"ok": True, "authenticated": True, "user": {"email": user["email"]}, "notice": auth_store.free_tier_notice()}, token=token, status_code=201)
+    except ValueError as error:
+        return JSONResponse({"error": "signup_failed", "detail": str(error)}, 400)
+    except Exception as error:
+        log_event("signup_failed", detail=str(error)[:120])
+        return JSONResponse({"error": "signup_failed", "detail": "Account could not be created. Please try again."}, 502)
+
+
+async def api_auth_login(request):
+    if not auth_store.configured() or not ensure_database():
+        return JSONResponse({"error": "accounts_unavailable", "detail": "Account storage is not configured yet."}, 503)
+    body = await request.json()
+    try:
+        user = auth_store.authenticate(str(body.get("email") or ""), str(body.get("password") or ""))
+        if not user:
+            return JSONResponse({"error": "login_failed", "detail": "Email or password is incorrect."}, 401)
+        token = auth_store.issue_session(user["id"])
+        with _SESSION_LOCK:
+            _SESSIONS[f"account-{user['id']}"] = _state_from_account(auth_store.load_state(user["id"]))
+        log_event("account_logged_in", user_id=user["id"])
+        return auth_response({"ok": True, "authenticated": True, "user": {"email": user["email"]}, "notice": auth_store.free_tier_notice()}, token=token)
+    except Exception as error:
+        log_event("login_failed", detail=str(error)[:120])
+        return JSONResponse({"error": "login_failed", "detail": "Account sign-in is temporarily unavailable."}, 502)
+
+
+async def api_auth_logout(request):
+    if auth_store.configured():
+        try:
+            auth_store.revoke_session(request.cookies.get(AUTH_COOKIE, ""))
+        except Exception as error:
+            log_event("logout_revoke_failed", detail=str(error)[:120])
+    response = JSONResponse({"ok": True, "authenticated": False})
+    response.delete_cookie(AUTH_COOKIE, samesite="lax", secure=bool(os.environ.get("RENDER")))
+    return response
 
 
 async def api_chat(request):
@@ -1054,6 +1192,10 @@ async def api_session(request):
 routes = [
     Route("/", index),
     Route("/healthz", api_health),
+    Route("/api/auth/status", api_auth_status),
+    Route("/api/auth/signup", api_auth_signup, methods=["POST"]),
+    Route("/api/auth/login", api_auth_login, methods=["POST"]),
+    Route("/api/auth/logout", api_auth_logout, methods=["POST"]),
     Route("/api/chat", api_chat, methods=["POST"]),
     Route("/api/settings", api_settings, methods=["GET", "POST"]),
     Route("/api/operation", api_operation, methods=["POST"]),

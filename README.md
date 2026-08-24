@@ -9,10 +9,10 @@ AeroSpeak ATC is a **voice-first ATC companion for Microsoft Flight Simulator 20
 | Capability | Behavior |
 |---|---|
 | Voice-only radio | The application accepts browser-recorded microphone transmissions only. There is no text transmission interface. |
-| Session isolation | Airport, controller selection, SimBrief context, settings, and conversation history are scoped to a browser session and expire automatically. They are not saved to a shared file. |
+| Personal accounts | With `DATABASE_URL` configured, signup and login persist each account’s airport, controller, SimBrief context, settings, operation state, and conversation history. Without the database, temporary browser sessions remain available for local development. |
 | SimBrief synchronization | A pilot can save a SimBrief Pilot ID in Settings and synchronize the most recent briefing. The application extracts callsign, aircraft, departure/destination/alternate, planned runways, route, cruise altitude, rules, equipment, and any available departure or arrival gate/stand value. |
 | Live airport context | Active radio use combines local airport/runway/frequency data with current METAR-derived ATIS. SimBrief adds flight-plan context when the pilot chooses to synchronize it. |
-| Ground taxi routing | With no synced flight plan, Ground can request mapped airport-surface data and produce a named stand-to-runway route only when a connected, named taxiway graph is available. With a synced plan, Ground tells the pilot to follow the flight plan. |
+| Ground operations | Ground handles engine start, pushback, and taxi as distinct voice requests. Taxi clearance uses the planned runway and stand from a synchronized flight plan when available, then issues a named route only when a verified mapped taxiway graph supports it. |
 | Frequency-driven controller | The pilot selects an airport and its listed Clearance, Ground, Tower, Approach, Departure, or ATIS frequency in Settings. The selected station governs the controller's role and response limits on every voice turn. |
 | Audio treatment | ElevenLabs speech is converted through the bundled ImageIO FFmpeg executable and processed with radio band-pass, compression, clicks, and hiss. |
 | Service safeguards | The service limits request size, transmission duration, per-session request rate, generated-audio retention, and can require an optional access code before it invokes live services. |
@@ -34,6 +34,7 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 | `GEMINI_MODEL` | No | Main Gemini model for future text-oriented operations. |
 | `GEMINI_LITE` | No | Gemini model used for the combined voice transcription and ATC response. |
 | `AEROSPEAK_ACCESS_CODE` | No | When set, users must enter this code in Settings before the app can make live SimBrief, ATIS, or radio requests. |
+| `DATABASE_URL` | For login/signup | Internal Render PostgreSQL connection URL. The included blueprint binds this automatically to the `aerospeak-accounts` database. |
 
 ## Pilot Flow
 
@@ -41,7 +42,7 @@ The pilot opens **Settings**, selects an airport, then selects the exact listed 
 
 Approach and Departure operate as **procedural non-radar** services. AeroSpeak relies on pilot position reports and does not claim radar contact, provide vectors, or infer aircraft position from the simulator. Ground taxi routes are derived from available open airport-surface mapping; the service refuses to invent a named route if the stand, runway, taxiway labels, or connectivity are not mapped. Airport layouts can differ from MSFS or third-party scenery, so the pilot must verify any route against the displayed simulator airport layout.
 
-The access code is a deployment-level shared gate, not a replacement for an identity system. For a multi-account public product, add an authenticated user database and persist session data in a managed datastore.
+The access code is a deployment-level shared gate. The included account feature uses salted `scrypt` password hashes, HTTP-only opaque session cookies, and account-scoped PostgreSQL state. The configured Free Render PostgreSQL instance is for personal use only: it expires 30 days after creation and has no backups, so export or upgrade it before expiration.
 
 ## Safety and Operations
 
@@ -52,7 +53,9 @@ The deployment exposes a `GET /healthz` endpoint. Logs emit compact JSON events 
 Run the repository’s focused regression suite with:
 
 ```bash
+python3 test_auth.py
 python3 test_flight_plan_sync.py
+python3 test_taxi_router.py
 ```
 
 The tests use mocked weather and briefing data to validate session isolation, voice-only request rejection, rate limiting, departure and destination prompt injection, key plan fields, and the non-radar response guard. A real SimBrief Pilot ID should still be used in a live staging deployment before release to verify the shape of an individual pilot’s latest briefing.

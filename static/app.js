@@ -4,10 +4,11 @@
   const gear = $('gear'), settings = $('settings'), simbrief = $('simbrief'), callsign = $('callsign'), gate = $('gate'), arrivalGate = $('arrivalGate');
   const saveBtn = $('save'), closeBtn = $('close'), syncPlan = $('syncPlan'), validatePlan = $('validatePlan'), saved = $('saved'), planstatus = $('planstatus'), controllerStatus = $('controllerStatus');
   const accessBlock = $('accessBlock'), accessCode = $('accessCode'), unlock = $('unlock');
+  const accountBtn = $('accountBtn'), authPanel = $('authPanel'), authEmail = $('authEmail'), authPassword = $('authPassword'), authStatus = $('authStatus'), authNotice = $('authNotice'), loginBtn = $('loginBtn'), signupBtn = $('signupBtn'), logoutBtn = $('logoutBtn');
   const apsearch = $('apsearch'), apresults = $('apresults'), freqrow = $('freqrow'), freqBadge = $('freqBadge');
   const departureMode = $('departureMode'), arrivalMode = $('arrivalMode');
   const modeChip = $('modeChip'), phaseChip = $('phaseChip'), readbackChip = $('readbackChip'), opAirport = $('opAirport'), opController = $('opController'), opRunway = $('opRunway'), opStand = $('opStand'), opLabel = $('opLabel'), opDetail = $('opDetail');
-  $('ver').textContent = 'v0.7.0';
+  $('ver').textContent = 'v0.8.0';
 
   let mediaRecorder = null, recording = false, stream = null, ctx = null, analyser = null;
   let curIcao = '', curController = '', curFreqs = {}, curOperation = {};
@@ -23,6 +24,39 @@
   function controllerFrequency(type) { return curFreqs[type] ? Number(curFreqs[type]).toFixed(3) : ''; }
   function stationLabel(type = curController) { const frequency = controllerFrequency(type); return type ? `${controllerNames[type]}${frequency ? ' · ' + frequency : ''}` : 'No controller selected'; }
   function stationName(type) { return controllerNames[type] || type || 'Not selected'; }
+
+  function renderAuth(data = {}) {
+    const configured = Boolean(data.configured), authenticated = Boolean(data.authenticated), user = data.user || {};
+    accountBtn.textContent = authenticated ? (user.email || 'Account') : 'Sign in';
+    authEmail.disabled = authenticated || !configured; authPassword.disabled = authenticated || !configured;
+    loginBtn.hidden = authenticated; signupBtn.hidden = authenticated; logoutBtn.hidden = !authenticated;
+    loginBtn.disabled = !configured; signupBtn.disabled = !configured;
+    authStatus.textContent = authenticated ? `Signed in as ${user.email}. Your AeroSpeak settings are saved to this personal account.` : (configured ? 'Create an account or sign in to save your AeroSpeak settings and operation state.' : 'Personal account storage is being connected.');
+    authNotice.textContent = data.notice || '';
+  }
+
+  async function loadAuth() {
+    try { const response = await fetch('/api/auth/status'); renderAuth(await response.json()); }
+    catch (_) { renderAuth({ configured:false, notice:'Account status is temporarily unavailable.' }); }
+  }
+
+  async function submitAuth(kind) {
+    const endpoint = kind === 'signup' ? '/api/auth/signup' : '/api/auth/login';
+    const button = kind === 'signup' ? signupBtn : loginBtn;
+    button.disabled = true;
+    try {
+      const response = await fetch(endpoint, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ email:authEmail.value.trim(), password:authPassword.value }) });
+      const data = await response.json(); if (!response.ok) throw new Error(data.detail || 'Account action failed.');
+      authPassword.value = ''; authPanel.classList.remove('open'); await loadAuth(); await loadSettings(); saved.textContent = kind === 'signup' ? 'Personal account created. Your radio settings now persist.' : 'Signed in. Your saved radio settings have been restored.';
+    } catch (error) { authNotice.textContent = error.message; }
+    finally { button.disabled = false; }
+  }
+
+  async function logout() {
+    logoutBtn.disabled = true;
+    try { await fetch('/api/auth/logout', { method:'POST' }); authEmail.value = ''; authPassword.value = ''; await loadAuth(); saved.textContent = 'Signed out. Create or sign in to an account before using live services.'; }
+    finally { logoutBtn.disabled = false; }
+  }
 
   function renderOperation(operation = {}) {
     curOperation = operation || {};
@@ -118,8 +152,9 @@
 
   ptt.addEventListener('pointerdown', event => { event.preventDefault(); unlockAudio(); startRecording(); }); ptt.addEventListener('pointerup', event => { event.preventDefault(); stopRecording(); }); ptt.addEventListener('pointerleave', stopRecording);
   document.addEventListener('keydown', event => { if (event.code === 'Space' && !event.repeat && !settings.classList.contains('open')) { event.preventDefault(); unlockAudio(); startRecording(); } }); document.addEventListener('keyup', event => { if (event.code === 'Space') stopRecording(); });
-  apsearch.addEventListener('input', () => searchAirports(apsearch.value.trim())); document.addEventListener('click', event => { if (!event.target.closest('.aprow')) apresults.classList.remove('open'); }); gear.addEventListener('click', () => settings.classList.toggle('open')); closeBtn.addEventListener('click', () => settings.classList.remove('open'));
+  apsearch.addEventListener('input', () => searchAirports(apsearch.value.trim())); document.addEventListener('click', event => { if (!event.target.closest('.aprow')) apresults.classList.remove('open'); }); gear.addEventListener('click', () => { authPanel.classList.remove('open'); settings.classList.toggle('open'); }); closeBtn.addEventListener('click', () => settings.classList.remove('open')); accountBtn.addEventListener('click', () => { settings.classList.remove('open'); authPanel.classList.toggle('open'); });
   saveBtn.addEventListener('click', async () => { saveBtn.disabled = true; try { await saveSettings(true); } catch (error) { saved.textContent = error.message; } finally { saveBtn.disabled = false; } }); syncPlan.addEventListener('click', syncFlightPlan); validatePlan.addEventListener('click', validateFlightPlan); departureMode.addEventListener('click', () => setOperation('DEPARTURE')); arrivalMode.addEventListener('click', () => setOperation('ARRIVAL'));
   unlock.addEventListener('click', async () => { unlock.disabled = true; try { const response = await fetch('/api/access', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ code: accessCode.value }) }); const data = await response.json(); if (!response.ok) throw new Error(data.detail || 'Access was not accepted.'); accessCode.value = ''; accessBlock.hidden = true; saved.textContent = 'Live services unlocked for this browser session.'; } catch (error) { saved.textContent = error.message; } finally { unlock.disabled = false; } });
-  loadSettings();
+  loginBtn.addEventListener('click', () => submitAuth('login')); signupBtn.addEventListener('click', () => submitAuth('signup')); logoutBtn.addEventListener('click', logout);
+  loadAuth(); loadSettings();
 })();

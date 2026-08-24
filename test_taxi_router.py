@@ -30,12 +30,23 @@ def test_named_stand_to_runway_route():
     assert route["taxiways"] == ["ALPHA", "BRAVO"]
 
 
-def test_synced_ground_call_follows_flight_plan():
+def test_ground_startup_and_pushback_are_distinct():
     state = server._blank_state()
     state["settings"].update({"controller_type": "GND", "callsign": "EUROPEAIR447"})
-    state["flight_plan"] = {"origin": "KJFK", "origin_runway": "08L", "callsign": "EUROPEAIR447"}
-    reply = server.ground_taxi_reply("EuropeAir 447 ready to taxi", state)
-    assert reply == "EUROPEAIR447, please follow your flight plan. Advise ready to taxi."
+    assert server.ground_taxi_reply("EuropeAir 447 request engine start", state) == "EUROPEAIR447, engine start approved. Advise ready for pushback."
+    assert server.ground_taxi_reply("EuropeAir 447 request pushback", state) == "EUROPEAIR447, pushback approved. Advise ready to taxi."
+
+
+def test_synced_ground_call_uses_planned_runway_and_verified_route():
+    state = server._blank_state()
+    state["settings"].update({"controller_type": "GND", "airport": "TEST", "callsign": "EUROPEAIR447"})
+    state["station_context"] = {"icao": "TEST"}
+    state["flight_plan"] = {"origin": "TEST", "origin_runway": "08L", "gate": "G1", "callsign": "EUROPEAIR447"}
+    server.APTS["TEST"] = {"lat": 0.0, "lon": 0.0}
+    route = {"ok": True, "runway": "08L", "taxiways": ["ALPHA", "BRAVO"]}
+    with patch.object(server, "route_from_stand_to_runway", return_value=route):
+        reply = server.ground_taxi_reply("EuropeAir 447 ready to taxi", state)
+    assert reply == "EUROPEAIR447, taxi to runway 08L via ALPHA, BRAVO, hold short runway 08L."
 
 
 def test_unsynced_ground_call_uses_verified_route():
@@ -51,6 +62,7 @@ def test_unsynced_ground_call_uses_verified_route():
 
 if __name__ == "__main__":
     test_named_stand_to_runway_route()
-    test_synced_ground_call_follows_flight_plan()
+    test_ground_startup_and_pushback_are_distinct()
+    test_synced_ground_call_uses_planned_runway_and_verified_route()
     test_unsynced_ground_call_uses_verified_route()
     print("AeroSpeak taxi-routing tests passed")

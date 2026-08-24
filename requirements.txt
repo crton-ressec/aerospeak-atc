@@ -5,3 +5,4 @@ scipy
 requests
 python-multipart
 imageio-ffmpeg
+psycopg[binary]
