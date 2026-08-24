@@ -1,7 +1,7 @@
 (() => {
   const $ = id => document.getElementById(id);
   const ptt = $('ptt'), meter = $('meter'), rx = $('rx'), logEl = $('log'), state = $('state');
-  const gear = $('gear'), settings = $('settings'), simbrief = $('simbrief'), callsign = $('callsign'), gate = $('gate'), scenario = $('scenario');
+  const gear = $('gear'), settings = $('settings'), simbrief = $('simbrief'), callsign = $('callsign'), gate = $('gate'), arrivalGate = $('arrivalGate'), scenario = $('scenario');
   const saveBtn = $('save'), closeBtn = $('close'), syncPlan = $('syncPlan'), validatePlan = $('validatePlan'), saved = $('saved'), planstatus = $('planstatus');
   const accessBlock = $('accessBlock'), accessCode = $('accessCode'), unlock = $('unlock');
   const apsearch = $('apsearch'), apresults = $('apresults'), freqrow = $('freqrow'), freqBadge = $('freqBadge');
@@ -16,17 +16,21 @@
     row.className = 'msg ' + kind;
     const who = document.createElement('span');
     who.className = 'who';
-    who.textContent = kind === 'pilot' ? 'YOU' : kind === 'atc' ? 'ATC' : kind === 'coach' ? 'COACH' : 'SYS';
+    who.textContent = kind === 'atc' ? 'ATC' : 'SYS';
     row.append(who, document.createTextNode(text));
     logEl.appendChild(row); logEl.scrollTop = logEl.scrollHeight;
   }
   function setState(text) { state.textContent = text; }
 
+  function isArrivalScenario() { return scenario.value.startsWith('arrival_'); }
+
   function renderPlanStatus(plan, validation) {
     if (!plan || !plan.origin) { planstatus.textContent = 'No flight plan synchronized yet.'; validatePlan.disabled = true; return; }
-    const gateText = plan.gate ? `Gate/stand ${plan.gate}` : 'Gate/stand not supplied';
+    const departureGate = plan.gate ? `Departure gate/stand ${plan.gate}` : 'Departure gate/stand not supplied';
+    const arrivalGateText = plan.arrival_gate ? `Arrival gate/stand ${plan.arrival_gate}` : 'Arrival gate/stand not supplied';
     const missing = validation && validation.missing && validation.missing.length ? `\nNeeds attention: ${validation.missing.join(', ')}.` : '';
-    planstatus.textContent = `Synced: ${plan.callsign || 'callsign unavailable'} · ${plan.origin} → ${plan.destination}\n${gateText} · ${plan.aircraft || 'aircraft unavailable'} · cruise ${plan.cruise_altitude || 'not specified'}\nLive METAR/ATIS refresh automatically during radio use.${missing}`;
+    const arrivalMode = isArrivalScenario() ? '\nArrival mode: destination METAR, ATIS, runway, and frequencies are active. Position reports are required; no radar vectors are simulated.' : '';
+    planstatus.textContent = `Synced: ${plan.callsign || 'callsign unavailable'} · ${plan.origin} → ${plan.destination}\n${departureGate} · ${arrivalGateText} · ${plan.aircraft || 'aircraft unavailable'} · cruise ${plan.cruise_altitude || 'not specified'}\nLive METAR/ATIS refresh automatically during radio use.${arrivalMode}${missing}`;
     validatePlan.disabled = false;
   }
 
@@ -85,12 +89,6 @@
     row.appendChild(button); logEl.appendChild(row); logEl.scrollTop = logEl.scrollHeight;
   }
 
-  function showDebrief(debrief) {
-    if (!debrief) return;
-    const notes = (debrief.notes || []).join(' ');
-    log('coach', `Score ${debrief.score ?? '—'}: ${notes} Next: ${debrief.next_action || 'Continue with the next ATC instruction.'}`);
-  }
-
   async function sendAudio(blob) {
     if (!blob.size) { setState('ready'); return; }
     const form = new FormData(); form.append('audio', blob, 'transmission.webm');
@@ -102,9 +100,7 @@
         log('sys', data.detail || data.error || 'Radio request failed.');
         setState('error'); setTimeout(() => setState('ready'), 1600); return;
       }
-      if (data.transcript) log('pilot', data.transcript);
       if (data.text) log('atc', data.text);
-      showDebrief(data.debrief);
       if (data.audio) playAudio(data.audio);
       if (data.context_refreshed) planstatus.textContent = planstatus.textContent.replace('Live METAR/ATIS refresh automatically during radio use.', 'Live METAR/ATIS refreshed for this transmission.');
       setState('ready');
@@ -162,7 +158,7 @@
   }
 
   async function saveSettings(extra = {}, announce = true) {
-    const payload = { simbrief_id: simbrief.value.trim(), callsign: callsign.value.trim(), gate: gate.value.trim(), scenario: scenario.value, airport: curIcao, ...extra };
+    const payload = { simbrief_id: simbrief.value.trim(), callsign: callsign.value.trim(), gate: gate.value.trim(), arrival_gate: arrivalGate.value.trim(), scenario: scenario.value, airport: curIcao, ...extra };
     const response = await fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
     if (!response.ok) throw new Error('Settings could not be saved.');
     syncPlan.disabled = !simbrief.value.trim();
@@ -175,8 +171,9 @@
     try {
       const response = await fetch('/api/flight-plan/sync', { method:'POST' }); const data = await response.json();
       if (!response.ok) throw new Error(data.detail || 'Flight-plan sync failed.');
-      const plan = data.flight_plan || {}; if (plan.callsign) callsign.value = plan.callsign; if (plan.gate) gate.value = plan.gate;
-      if (plan.origin) { apsearch.value = plan.origin; await loadFreqs(plan.origin); }
+      const plan = data.flight_plan || {}; if (plan.callsign) callsign.value = plan.callsign; if (plan.gate) gate.value = plan.gate; if (plan.arrival_gate) arrivalGate.value = plan.arrival_gate;
+      const activeAirport = isArrivalScenario() ? plan.destination : plan.origin;
+      if (activeAirport) { apsearch.value = activeAirport; await loadFreqs(activeAirport); }
       renderPlanStatus(plan, data.validation); saved.textContent = 'Flight plan synchronized.';
     } catch (error) { planstatus.textContent = error.message; }
     finally { syncPlan.disabled = !simbrief.value.trim(); syncPlan.textContent = 'Sync Flight Plan'; }
@@ -194,9 +191,9 @@
   async function loadSettings() {
     try {
       const response = await fetch('/api/settings'); const data = await response.json();
-      simbrief.value = data.simbrief_id || ''; callsign.value = data.callsign || ''; gate.value = data.gate || ''; scenario.value = data.scenario || 'ifr_clearance';
+      simbrief.value = data.simbrief_id || ''; callsign.value = data.callsign || ''; gate.value = data.gate || ''; arrivalGate.value = data.arrival_gate || ''; scenario.value = data.scenario || 'ifr_clearance';
       accessBlock.hidden = !(data.access_required && !data.authorized);
-      const plan = data.flight_plan || {}; const airport = plan.origin || data.airport || '';
+      const plan = data.flight_plan || {}; const airport = (isArrivalScenario() ? plan.destination : plan.origin) || data.airport || '';
       syncPlan.disabled = !simbrief.value.trim(); renderPlanStatus(plan, data.validation);
       if (airport) { curIcao = airport; apsearch.value = airport; await loadFreqs(airport); }
     } catch (_) { planstatus.textContent = 'Could not restore this browser session.'; }

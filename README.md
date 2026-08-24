@@ -1,6 +1,6 @@
 # AeroSpeak ATC
 
-AeroSpeak ATC is a **voice-first** AI air-traffic-control practice application for console flight simmers. A pilot configures a session in Settings, holds the transmit control to speak, receives an ATC response with VHF-style audio, and receives immediate coaching after each exchange.
+AeroSpeak ATC is a **voice-first** AI air-traffic-control practice application for console flight simmers. A pilot configures a session in Settings, holds the transmit control to speak, and receives an ATC response with VHF-style audio.
 
 > AeroSpeak is for flight-simulation practice only. It is not for real-world aviation navigation or operational use.
 
@@ -10,9 +10,9 @@ AeroSpeak ATC is a **voice-first** AI air-traffic-control practice application f
 |---|---|
 | Voice-only radio | The application accepts browser-recorded microphone transmissions only. There is no text transmission interface. |
 | Session isolation | Settings, SimBrief context, scenario, and conversation history are scoped to a browser session and expire automatically. They are not saved to a shared file. |
-| SimBrief synchronization | A pilot can save a SimBrief Pilot ID in Settings and synchronize the most recent briefing. The application extracts callsign, aircraft, departure/destination/alternate, planned runways, route, cruise altitude, rules, equipment, and any available gate/stand value. |
-| Live airport context | Sync and active radio use combine the briefing with local airport/runway/frequency data plus current METAR-derived ATIS. Live context refreshes at most once every five minutes during radio use, and can be refreshed manually in Settings. |
-| Training modes | IFR clearance, ground/taxi, tower departure, and VFR pattern scenarios influence the controller prompt and the deterministic post-transmission coaching. |
+| SimBrief synchronization | A pilot can save a SimBrief Pilot ID in Settings and synchronize the most recent briefing. The application extracts callsign, aircraft, departure/destination/alternate, planned runways, route, cruise altitude, rules, equipment, and any available departure or arrival gate/stand value. |
+| Live airport context | Sync and active radio use combine the briefing with local departure **and destination** airport/runway/frequency data plus current METAR-derived ATIS. Live context refreshes at most once every five minutes during radio use, and can be refreshed manually in Settings. |
+| ATC scenarios | IFR clearance, ground/taxi, tower departure, VFR pattern, procedural non-radar arrival, and arrival taxi-in scenarios shape the controller's operational context. |
 | Audio treatment | ElevenLabs speech is converted through the bundled ImageIO FFmpeg executable and processed with radio band-pass, compression, clicks, and hiss. |
 | Service safeguards | The service limits request size, transmission duration, per-session request rate, generated-audio retention, and can require an optional access code before it invokes live services. |
 
@@ -36,7 +36,7 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 
 ## Pilot Flow
 
-The pilot opens **Settings**, saves a SimBrief Pilot ID, callsign, optional gate/stand, and scenario, then selects **Sync Flight Plan**. AeroSpeak retrieves the pilot’s latest SimBrief briefing, validates the key fields, makes the departure airport active, and holds all briefing detail within that session. The main screen remains focused on the hold-to-talk radio control.
+The pilot opens **Settings**, saves a SimBrief Pilot ID, callsign, optional departure/arrival stand, and scenario, then selects **Sync Flight Plan**. AeroSpeak retrieves the pilot’s latest briefing, validates the key fields, and stores both departure and destination operational context in that browser session. For departure scenarios, the active airport is the origin. For arrival scenarios, the active airport is the destination and the controller uses a procedural **non-radar** flow: pilot position reports, destination ATIS, runway assignment, landing clearance, and taxi-in without radar contact or vectors. The main screen remains focused on the hold-to-talk radio control.
 
 The access code is a deployment-level shared gate, not a replacement for an identity system. For a multi-account public product, add an authenticated user database and persist session data in a managed datastore.
 
@@ -52,4 +52,4 @@ Run the repository’s focused regression suite with:
 python3 test_flight_plan_sync.py
 ```
 
-The tests use mocked weather and briefing data to validate session isolation, voice-only request rejection, rate limiting, synchronized prompt injection, and key plan fields. A real SimBrief Pilot ID should still be used in a live staging deployment before release to verify the shape of an individual pilot’s latest briefing.
+The tests use mocked weather and briefing data to validate session isolation, voice-only request rejection, rate limiting, departure and destination prompt injection, key plan fields, and the non-radar response guard. A real SimBrief Pilot ID should still be used in a live staging deployment before release to verify the shape of an individual pilot’s latest briefing.

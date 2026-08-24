@@ -23,7 +23,7 @@ def fake_request(cookie=None):
 
 def test_context_injection():
     state = server._blank_state()
-    state["settings"].update({"simbrief_id": "12345", "gate": "B12"})
+    state["settings"].update({"simbrief_id": "12345", "gate": "B12", "arrival_gate": "C18", "scenario": "arrival_nonradar"})
     with patch.object(server, "fetch_metar", return_value=METAR):
         plan = server.normalize_flight_plan(SAMPLE_PLAN, state)
     state["flight_plan"] = plan
@@ -31,9 +31,20 @@ def test_context_injection():
     prompt = server.system_prompt(state)
     assert plan["callsign"] == "AAL100"
     assert plan["gate"] == "B12"
+    assert plan["arrival_gate"] == "C18"
     assert "CURRENT DEPARTURE ATIS" in context
-    assert "DEPARTURE FREQUENCIES" in context
-    assert "AAL100" in prompt and "KJFK" in prompt and "B12" in prompt
+    assert "CURRENT DESTINATION ATIS" in context
+    assert "DESTINATION FREQUENCIES" in context
+    assert "AAL100" in prompt and "KJFK" in prompt and "KLAX" in prompt and "C18" in prompt
+    assert "Never claim or imply radar contact" in prompt
+
+
+def test_nonradar_guard_rewrites_radar_language():
+    state = server._blank_state()
+    state["settings"]["scenario"] = "arrival_nonradar"
+    reply = server.enforce_nonradar_reply("Radar contact. Fly heading zero niner zero.", state)
+    assert "Negative radar service" in reply
+    assert "radar contact" not in reply.lower()
 
 
 def test_browser_sessions_are_isolated():
@@ -82,6 +93,7 @@ def test_voice_only_boundary_rejects_json():
 
 if __name__ == "__main__":
     test_context_injection()
+    test_nonradar_guard_rewrites_radar_language()
     test_browser_sessions_are_isolated()
     test_rate_limit_blocks_excess_requests()
     test_optional_access_gate()
