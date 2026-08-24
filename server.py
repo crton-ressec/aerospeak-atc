@@ -40,7 +40,8 @@ VOICE_ID = os.environ.get("ATC_VOICE", "IKne3meq5aSn9XLyUdCD")
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_turbo_v2_5")
 # Voice requests must prefer the explicitly configured model. The former
 # gemini-flash-lite-latest alias is no longer used as a silent fallback.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_AUDIO_FALLBACK = "gemini-3.1-flash-lite"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", GEMINI_AUDIO_FALLBACK)
 GEMINI_LITE = os.environ.get("GEMINI_LITE") or GEMINI_MODEL
 ACCESS_CODE = os.environ.get("AEROSPEAK_ACCESS_CODE", "").strip()
 AUTH_COOKIE = "aerospeak_auth"
@@ -668,28 +669,36 @@ def convert_to_wav(source_path, target_path, sample_rate):
 
 
 def gemini_call(contents, model=None, retries=3):
-    model = model or GEMINI_MODEL
-    for attempt in range(retries):
-        payload = json.dumps({"contents": contents}).encode()
-        request = Request(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            data=payload,
-            headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY},
-        )
-        try:
-            with urlopen(request, timeout=45) as response:
-                data = json.loads(response.read().decode())
-            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            if text:
-                log_event("gemini_request_succeeded", model=model, attempt=attempt + 1)
-                return text
-        except HTTPError as error:
-            log_event("gemini_request_http_error", model=model, status=error.code, attempt=attempt + 1)
-            if error.code not in (429, 500, 502, 503):
-                raise
-        except (KeyError, IndexError, TypeError):
-            log_event("gemini_request_empty_response", model=model, attempt=attempt + 1)
-        time.sleep(1.5 * (attempt + 1))
+    """Call Gemini and recover once when a configured model name no longer exists."""
+    selected_model = model or GEMINI_MODEL
+    candidates = [selected_model]
+    if selected_model != GEMINI_AUDIO_FALLBACK:
+        candidates.append(GEMINI_AUDIO_FALLBACK)
+    payload = json.dumps({"contents": contents}).encode()
+    for candidate_model in candidates:
+        for attempt in range(retries):
+            request = Request(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent",
+                data=payload,
+                headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY},
+            )
+            try:
+                with urlopen(request, timeout=45) as response:
+                    data = json.loads(response.read().decode())
+                text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                if text:
+                    log_event("gemini_request_succeeded", model=candidate_model, attempt=attempt + 1)
+                    return text
+            except HTTPError as error:
+                log_event("gemini_request_http_error", model=candidate_model, status=error.code, attempt=attempt + 1)
+                if error.code == 404:
+                    log_event("gemini_model_fallback", unavailable_model=candidate_model, fallback_model=GEMINI_AUDIO_FALLBACK)
+                    break
+                if error.code not in (429, 500, 502, 503):
+                    raise
+            except (KeyError, IndexError, TypeError):
+                log_event("gemini_request_empty_response", model=candidate_model, attempt=attempt + 1)
+            time.sleep(1.5 * (attempt + 1))
     return "Say again?"
 
 
