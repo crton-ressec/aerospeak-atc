@@ -23,10 +23,12 @@ def fake_request(cookie=None):
 
 def test_context_injection():
     state = server._blank_state()
-    state["settings"].update({"simbrief_id": "12345", "gate": "B12", "arrival_gate": "C18", "scenario": "arrival_nonradar"})
+    state["settings"].update({"simbrief_id": "12345", "gate": "B12", "arrival_gate": "C18", "airport": "KLAX", "controller_type": "APP", "controller_frequency": "124.500"})
     with patch.object(server, "fetch_metar", return_value=METAR):
         plan = server.normalize_flight_plan(SAMPLE_PLAN, state)
     state["flight_plan"] = plan
+    with patch.object(server, "fetch_metar", return_value=METAR):
+        server.refresh_station_context(state, force=True)
     context = server.flight_plan_context(state)
     prompt = server.system_prompt(state)
     assert plan["callsign"] == "AAL100"
@@ -36,12 +38,30 @@ def test_context_injection():
     assert "CURRENT DESTINATION ATIS" in context
     assert "DESTINATION FREQUENCIES" in context
     assert "AAL100" in prompt and "KJFK" in prompt and "KLAX" in prompt and "C18" in prompt
-    assert "Never claim or imply radar contact" in prompt
+    assert "ACTIVE MSFS 2024 VOICE ATC STATION" in prompt
+    assert "CONTROLLER: Approach (APP)" in prompt
+    assert "never claim radar contact" in prompt.lower()
+
+
+def test_selected_controller_frequency_context():
+    state = server._blank_state()
+    state["settings"].update({"airport": "KJFK", "controller_type": "GND", "controller_frequency": "121.650"})
+    state["station_context"] = {
+        "icao": "KJFK",
+        "metar": "KJFK 231651Z 24012KT 10SM FEW050 25/16 A2992",
+        "atis": "THIS IS KJFK ATIS INFORMATION A",
+        "airport_context": "AIRPORT: John F. Kennedy International Airport (KJFK)",
+        "frequencies": {"CLD": 135.05, "GND": 121.65, "TWR": 119.1},
+    }
+    context = server.active_controller_context(state)
+    assert "CONTROLLER: Ground (GND)" in context
+    assert "SELECTED FREQUENCY: 121.650" in context
+    assert "taxi" in context.lower()
 
 
 def test_nonradar_guard_rewrites_radar_language():
     state = server._blank_state()
-    state["settings"]["scenario"] = "arrival_nonradar"
+    state["settings"]["controller_type"] = "APP"
     reply = server.enforce_nonradar_reply("Radar contact. Fly heading zero niner zero.", state)
     assert "Negative radar service" in reply
     assert "radar contact" not in reply.lower()
@@ -93,6 +113,7 @@ def test_voice_only_boundary_rejects_json():
 
 if __name__ == "__main__":
     test_context_injection()
+    test_selected_controller_frequency_context()
     test_nonradar_guard_rewrites_radar_language()
     test_browser_sessions_are_isolated()
     test_rate_limit_blocks_excess_requests()

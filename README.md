@@ -1,18 +1,19 @@
 # AeroSpeak ATC
 
-AeroSpeak ATC is a **voice-first** AI air-traffic-control practice application for console flight simmers. A pilot configures a session in Settings, holds the transmit control to speak, and receives an ATC response with VHF-style audio.
+AeroSpeak ATC is a **voice-first ATC companion for Microsoft Flight Simulator 2024**. It replaces menu-driven radio selections with a chosen airport controller frequency, hold-to-talk transmission, concise ATC replies, and VHF-style audio.
 
-> AeroSpeak is for flight-simulation practice only. It is not for real-world aviation navigation or operational use.
+> AeroSpeak is for flight-simulation use only. It is not for real-world aviation navigation or operational use.
 
 ## Current Capabilities
 
 | Capability | Behavior |
 |---|---|
 | Voice-only radio | The application accepts browser-recorded microphone transmissions only. There is no text transmission interface. |
-| Session isolation | Settings, SimBrief context, scenario, and conversation history are scoped to a browser session and expire automatically. They are not saved to a shared file. |
+| Session isolation | Airport, controller selection, SimBrief context, settings, and conversation history are scoped to a browser session and expire automatically. They are not saved to a shared file. |
 | SimBrief synchronization | A pilot can save a SimBrief Pilot ID in Settings and synchronize the most recent briefing. The application extracts callsign, aircraft, departure/destination/alternate, planned runways, route, cruise altitude, rules, equipment, and any available departure or arrival gate/stand value. |
-| Live airport context | Sync and active radio use combine the briefing with local departure **and destination** airport/runway/frequency data plus current METAR-derived ATIS. Live context refreshes at most once every five minutes during radio use, and can be refreshed manually in Settings. |
-| ATC scenarios | IFR clearance, ground/taxi, tower departure, VFR pattern, procedural non-radar arrival, and arrival taxi-in scenarios shape the controller's operational context. |
+| Live airport context | Active radio use combines local airport/runway/frequency data with current METAR-derived ATIS. SimBrief adds flight-plan context when the pilot chooses to synchronize it. |
+| Ground taxi routing | With no synced flight plan, Ground can request mapped airport-surface data and produce a named stand-to-runway route only when a connected, named taxiway graph is available. With a synced plan, Ground tells the pilot to follow the flight plan. |
+| Frequency-driven controller | The pilot selects an airport and its listed Clearance, Ground, Tower, Approach, Departure, or ATIS frequency in Settings. The selected station governs the controller's role and response limits on every voice turn. |
 | Audio treatment | ElevenLabs speech is converted through the bundled ImageIO FFmpeg executable and processed with radio band-pass, compression, clicks, and hiss. |
 | Service safeguards | The service limits request size, transmission duration, per-session request rate, generated-audio retention, and can require an optional access code before it invokes live services. |
 
@@ -36,7 +37,9 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 
 ## Pilot Flow
 
-The pilot opens **Settings**, saves a SimBrief Pilot ID, callsign, optional departure/arrival stand, and scenario, then selects **Sync Flight Plan**. AeroSpeak retrieves the pilot’s latest briefing, validates the key fields, and stores both departure and destination operational context in that browser session. For departure scenarios, the active airport is the origin. For arrival scenarios, the active airport is the destination and the controller uses a procedural **non-radar** flow: pilot position reports, destination ATIS, runway assignment, landing clearance, and taxi-in without radar contact or vectors. The main screen remains focused on the hold-to-talk radio control.
+The pilot opens **Settings**, selects an airport, then selects the exact listed controller frequency they are calling. AeroSpeak persists that airport and station for the browser session, loads its local runway/frequency data plus live METAR-derived ATIS, and confines every reply to the selected station’s role. A SimBrief sync is optional and adds callsign, aircraft, route, departure/destination context, and available stand information. The main screen remains focused on hold-to-talk radio interaction.
+
+Approach and Departure operate as **procedural non-radar** services. AeroSpeak relies on pilot position reports and does not claim radar contact, provide vectors, or infer aircraft position from the simulator. Ground taxi routes are derived from available open airport-surface mapping; the service refuses to invent a named route if the stand, runway, taxiway labels, or connectivity are not mapped. Airport layouts can differ from MSFS or third-party scenery, so the pilot must verify any route against the displayed simulator airport layout.
 
 The access code is a deployment-level shared gate, not a replacement for an identity system. For a multi-account public product, add an authenticated user database and persist session data in a managed datastore.
 
