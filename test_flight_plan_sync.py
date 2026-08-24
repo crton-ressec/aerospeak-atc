@@ -111,6 +111,43 @@ def test_voice_only_boundary_rejects_json():
     assert response.status_code == 415
 
 
+def test_operational_ifr_clearance_and_readback():
+    state = server._blank_state()
+    state["settings"].update({"controller_type": "CLD", "callsign": "AAL100"})
+    state["flight_plan"] = {"callsign": "AAL100", "origin": "KJFK", "destination": "KLAX", "cruise_altitude": "35000"}
+    reply = server.clearance_delivery_reply("American 100 at gate B12 IFR to Los Angeles request clearance", state)
+    assert "cleared to KLAX airport as filed" in reply
+    assert state["operation"]["phase"] == "CLEARANCE"
+    server.register_pending_readback(reply, state)
+    assert state["operation"]["pending_readback"]
+    assert "read back" in server.readback_correction("roger", state).lower()
+    assert server.readback_correction("AAL100 cleared to KLAX airport maintain 35000", state) == ""
+
+
+def test_emergency_transitions_to_priority_operation():
+    state = server._blank_state()
+    state["settings"]["callsign"] = "EUROPEAIR447"
+    reply = server.emergency_reply("Mayday EuropeAir 447 engine fire", state)
+    assert "roger emergency" in reply.lower()
+    assert state["operation"]["phase"] == "EMERGENCY"
+    assert state["operation"]["emergency"] is True
+
+
+def test_operation_context_never_claims_telemetry():
+    state = server._blank_state()
+    context = server.operation_context(state)
+    assert "no live aircraft position" in context.lower()
+    assert "traffic flow" in context.lower()
+
+
+def test_line_up_and_wait_does_not_become_takeoff_clearance():
+    state = server._blank_state()
+    state["settings"]["controller_type"] = "TWR"
+    server.transition_from_reply("Runway 04L, line up and wait.", "ready for departure", state)
+    assert state["operation"]["phase"] == "RUNWAY_WAIT"
+    assert "takeoff clearance remains required" in state["operation"]["last_transition"].lower()
+
+
 if __name__ == "__main__":
     test_context_injection()
     test_selected_controller_frequency_context()
@@ -119,4 +156,8 @@ if __name__ == "__main__":
     test_rate_limit_blocks_excess_requests()
     test_optional_access_gate()
     test_voice_only_boundary_rejects_json()
-    print("AeroSpeak session, flight-plan, safety, and voice-only tests passed")
+    test_operational_ifr_clearance_and_readback()
+    test_emergency_transitions_to_priority_operation()
+    test_operation_context_never_claims_telemetry()
+    test_line_up_and_wait_does_not_become_takeoff_clearance()
+    print("AeroSpeak session, flight-plan, safety, voice-only, and operational-flow tests passed")

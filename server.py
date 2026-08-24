@@ -53,6 +53,24 @@ class AudioLimitError(ValueError):
     """Raised when a pilot holds transmit longer than the service allows."""
 
 
+OPERATION_PHASES = {
+    "PRE_FLIGHT": "Pre-flight setup",
+    "CLEARANCE": "Clearance received",
+    "PUSHBACK": "Pushback / engine start",
+    "TAXI_OUT": "Taxi to departure runway",
+    "HOLD_SHORT": "Holding short",
+    "RUNWAY_WAIT": "Line up and wait",
+    "DEPARTURE": "Departure / climb-out",
+    "ENROUTE": "En route",
+    "ARRIVAL_CHECKIN": "Arrival check-in",
+    "APPROACH": "Approach / landing sequence",
+    "LANDING": "Landing / runway exit",
+    "TAXI_IN": "Taxi to parking",
+    "PARKED": "At parking",
+    "EMERGENCY": "Priority operation",
+}
+
+
 CONTROLLER_PROFILES = {
     "ATIS": {"name": "ATIS", "scope": "Give the current recorded-information-style broadcast only. Do not issue clearances, taxi instructions, or landing clearances."},
     "CLD": {"name": "Clearance Delivery", "scope": "Handle IFR/VFR clearance requests and clearance readbacks. Issue a handoff to Ground when appropriate; do not issue taxi, takeoff, or landing instructions."},
@@ -93,6 +111,14 @@ def _blank_state():
         "flight_plan": {},
         "station_context": {},
         "last_taxi_route": {},
+        "operation": {
+            "mode": "DEPARTURE",
+            "phase": "PRE_FLIGHT",
+            "last_transition": "Select an airport and controller, then begin the operation.",
+            "pending_readback": {},
+            "emergency": False,
+            "updated_at": int(time.time()),
+        },
         "history": [],
         "atis_roll": {},
         "last_context_refresh": 0.0,
@@ -288,6 +314,53 @@ def refresh_station_context(state, force=False):
     return context
 
 
+def operation_snapshot(state):
+    operation = state.get("operation", {})
+    plan = state.get("flight_plan", {})
+    station = state.get("station_context", {})
+    mode = operation.get("mode", "DEPARTURE")
+    runway = plan.get("destination_runway") if mode == "ARRIVAL" else plan.get("origin_runway")
+    return {
+        "mode": mode,
+        "phase": operation.get("phase", "PRE_FLIGHT"),
+        "phase_label": OPERATION_PHASES.get(operation.get("phase"), "Unknown operation state"),
+        "last_transition": operation.get("last_transition", ""),
+        "pending_readback": operation.get("pending_readback", {}),
+        "emergency": bool(operation.get("emergency")),
+        "airport": station.get("icao") or state["settings"].get("airport", ""),
+        "controller": state["settings"].get("controller_type", ""),
+        "frequency": state["settings"].get("controller_frequency", ""),
+        "planned_runway": runway or "",
+        "stand": plan.get("arrival_gate") if mode == "ARRIVAL" else plan.get("gate") or state["settings"].get("gate", ""),
+        "taxi_route": state.get("last_taxi_route", {}),
+    }
+
+
+def transition_operation(state, phase, message, emergency=False):
+    operation = state.setdefault("operation", {})
+    operation.update({"phase": phase, "last_transition": message, "emergency": emergency, "updated_at": int(time.time())})
+    if phase != "EMERGENCY":
+        operation["emergency"] = False
+
+
+def operation_context(state):
+    snapshot = operation_snapshot(state)
+    pending = snapshot.get("pending_readback") or {}
+    fields = [
+        "SIMULATED OPERATION STATE — use this only for the session flow, not as evidence of simulator telemetry:",
+        f"MODE: {snapshot['mode']}",
+        f"PHASE: {snapshot['phase_label']}",
+        f"LAST TRANSITION: {snapshot['last_transition']}",
+        f"PLANNED RUNWAY: {snapshot['planned_runway'] or 'not specified'}",
+        f"PARKING/STAND: {snapshot['stand'] or 'not specified'}",
+        "There is no live aircraft position, traffic, runway occupancy, or tuned-radio telemetry. Require pilot reports when those facts matter.",
+        "Do not simulate traffic flow, runway occupancy, or a traffic-based clearance without an explicit pilot report.",
+    ]
+    if pending:
+        fields.append(f"PENDING READBACK: {pending.get('description', 'required instruction readback')}")
+    return "\n".join(fields)
+
+
 def active_controller_context(state):
     settings = state["settings"]
     station = state.get("station_context", {})
@@ -450,9 +523,11 @@ def system_prompt(state):
     return f"""You are AeroSpeak, a voice-first ATC companion designed to replace menu-driven ATC interaction in Microsoft Flight Simulator 2024.
 You are the exact airport controller selected by the pilot in Settings, speaking concise standard US VHF phraseology. Never describe yourself as a menu-based simulator system.
 Stay strictly within the selected controller's role. If the pilot calls the wrong station, state the correct station and frequency only when that frequency is supplied in the active airport data. If no active station is selected, ask the pilot to select an airport and controller in Settings.
+For departure operations, handle ATIS, IFR clearance, pushback/engine-start coordination, taxi, hold short, line up and wait, takeoff, and departure handoff only within the selected station role. For arrival operations, handle procedural non-radar position reporting, destination ATIS, landing, runway exit, and taxi to parking only within the selected station role.
+A line-up-and-wait instruction is not takeoff clearance. Hold-short, line-up-and-wait, takeoff, and landing instructions require an explicit pilot readback when the session marks one as pending. If the pilot declares an emergency, acknowledge priority and request only the emergency facts you need.
 Never invent an airport, gate, runway, frequency, route, weather report, clearance, charted procedure, traffic, or simulator state. You do not have aircraft telemetry; rely on the pilot's spoken position, altitude, runway status, and flight phase. Keep each reply under 45 words.
 Read numbers as spoken ATC (for example, 'two five zero' and 'squawk one two three four').
-{active_controller_context(state)}{chr(10) + flight_plan_context(state) if flight_plan_context(state) else ''}"""
+{active_controller_context(state)}\n{operation_context(state)}{chr(10) + flight_plan_context(state) if flight_plan_context(state) else ''}"""
 
 
 def load_wav_bytes(blob, sample_rate=44100):
@@ -669,6 +744,90 @@ def ground_taxi_reply(transcript, state):
     return f"{callsign}, taxi to runway {route['runway']} via {taxiways}, hold short runway {route['runway']}."
 
 
+def _normalized(text):
+    return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+
+
+def emergency_reply(transcript, state):
+    text = (transcript or "").upper()
+    terms = ("MAYDAY", "PAN PAN", "EMERGENCY", "ENGINE FAILURE", "ENGINE FIRE", "SMOKE", "MEDICAL EMERGENCY")
+    if not any(term in text for term in terms):
+        return ""
+    callsign = _spoken_callsign(state)
+    transition_operation(state, "EMERGENCY", "Priority operation reported by pilot.", emergency=True)
+    state["operation"]["pending_readback"] = {}
+    return f"{callsign}, roger emergency. State nature of emergency, souls on board, fuel remaining, and intentions."
+
+
+def clearance_delivery_reply(transcript, state):
+    if state["settings"].get("controller_type") != "CLD":
+        return ""
+    text = (transcript or "").upper()
+    plan = state.get("flight_plan", {})
+    if not plan.get("destination") or not ("IFR" in text or "CLEARANCE" in text):
+        return ""
+    callsign = _spoken_callsign(state)
+    altitude = plan.get("cruise_altitude") or "filed altitude"
+    transition_operation(state, "CLEARANCE", "IFR clearance issued from synchronized flight plan.")
+    return f"{callsign}, cleared to {plan['destination']} airport as filed, maintain {altitude}. Advise ready to taxi."
+
+
+def readback_correction(transcript, state):
+    pending = state.get("operation", {}).get("pending_readback", {})
+    if not pending:
+        return ""
+    text = _normalized(transcript)
+    expected = [_normalized(item) for item in pending.get("required", []) if item]
+    if expected and all(item in text for item in expected):
+        state["operation"]["pending_readback"] = {}
+        return ""
+    callsign = _spoken_callsign(state)
+    return f"{callsign}, read back {pending.get('description', 'the instruction')}."
+
+
+def register_pending_readback(reply, state):
+    """Track only critical clearances that should be explicitly repeated in the next call."""
+    text = (reply or "").upper()
+    operation = state.setdefault("operation", {})
+    pending = {}
+    runway_match = re.search(r"RUNWAY\s+(\d{1,2}[LRC]?)", text)
+    runway = runway_match.group(1) if runway_match else ""
+    if "HOLD SHORT" in text:
+        pending = {"description": f"hold short of runway {runway or 'assignment'}", "required": ["HOLD SHORT", runway]}
+    elif "LINE UP AND WAIT" in text:
+        pending = {"description": f"line up and wait runway {runway or 'assignment'}", "required": ["LINE UP AND WAIT", runway]}
+    elif "CLEARED FOR TAKEOFF" in text:
+        pending = {"description": f"takeoff clearance runway {runway or 'assignment'}", "required": ["TAKEOFF", runway]}
+    elif "CLEARED TO LAND" in text:
+        pending = {"description": f"landing clearance runway {runway or 'assignment'}", "required": ["LAND", runway]}
+    elif "CLEARED TO" in text and "AIRPORT" in text:
+        destination = state.get("flight_plan", {}).get("destination", "")
+        pending = {"description": "IFR clearance destination and altitude", "required": [destination, state.get("flight_plan", {}).get("cruise_altitude", "")]}
+    if pending:
+        operation["pending_readback"] = pending
+
+
+def transition_from_reply(reply, transcript, state):
+    text = (reply or "").upper()
+    pilot = (transcript or "").upper()
+    controller = state["settings"].get("controller_type")
+    if "LINE UP AND WAIT" in text:
+        transition_operation(state, "RUNWAY_WAIT", "Line up and wait issued; takeoff clearance remains required.")
+    elif "CLEARED FOR TAKEOFF" in text:
+        transition_operation(state, "DEPARTURE", "Takeoff clearance issued in the simulation flow.")
+    elif "CLEARED TO LAND" in text:
+        transition_operation(state, "LANDING", "Landing clearance issued in the simulation flow.")
+    elif controller == "GND" and ("TAXI" in text or "HOLD SHORT" in text):
+        phase = "HOLD_SHORT" if "HOLD SHORT" in text else ("TAXI_IN" if state.get("operation", {}).get("mode") == "ARRIVAL" else "TAXI_OUT")
+        transition_operation(state, phase, "Ground movement instruction issued.")
+    elif controller == "APP" and ("REPORT" in text or "APPROACH" in text):
+        transition_operation(state, "APPROACH", "Procedural arrival coordination active.")
+    elif controller == "DEP":
+        transition_operation(state, "DEPARTURE", "Procedural departure coordination active.")
+    elif state.get("operation", {}).get("mode") == "ARRIVAL" and controller == "GND" and ("PARKING" in pilot or "AT THE GATE" in pilot):
+        transition_operation(state, "PARKED", "Pilot reported parked.")
+
+
 def enforce_nonradar_reply(reply, state):
     """Prevent departure and approach responses from contradicting the no-radar design."""
     if state["settings"].get("controller_type") not in ("APP", "DEP"):
@@ -721,10 +880,13 @@ async def api_chat(request):
     except Exception as error:
         return session_response(request, {"error": "transcribe_failed", "detail": str(error)}, 502)
     transcript, reply = parse_combined_reply(combined)
-    deterministic_ground_reply = ground_taxi_reply(transcript, state)
-    reply = deterministic_ground_reply or enforce_nonradar_reply(reply, state)
+    safety_reply = emergency_reply(transcript, state) or readback_correction(transcript, state)
+    deterministic_reply = clearance_delivery_reply(transcript, state) or ground_taxi_reply(transcript, state)
+    reply = safety_reply or deterministic_reply or enforce_nonradar_reply(reply, state)
     if not reply or reply.lower() == "say again?":
         return session_response(request, {"error": "brain_unavailable", "detail": "ATC could not form a usable reply."}, 502)
+    transition_from_reply(reply, transcript, state)
+    register_pending_readback(reply, state)
     state["history"].extend([{"role": "user", "text": transcript}, {"role": "model", "text": reply}])
     log_event("radio_turn", session=request.state.aerospeak_session_id[-8:], controller=state["settings"].get("controller_type"), airport=state["settings"].get("airport"), synced=bool(state.get("flight_plan")), refreshed=refreshed or station_refreshed)
     state["history"] = state["history"][-12:]
@@ -733,7 +895,7 @@ async def api_chat(request):
         audio_url = f"/audio/{audio.name}"
     except Exception:
         audio_url = None
-    return session_response(request, {"text": reply, "audio": audio_url, "context_refreshed": refreshed or station_refreshed})
+    return session_response(request, {"text": reply, "audio": audio_url, "context_refreshed": refreshed or station_refreshed, "operation": operation_snapshot(state)})
 
 
 async def api_audio(request):
@@ -751,7 +913,7 @@ async def api_settings(request):
     state = session_for(request)
     settings = state["settings"]
     if request.method == "GET":
-        return session_response(request, {**settings, "flight_plan": state.get("flight_plan", {}), "validation": plan_validation(state.get("flight_plan", {})), "station": state.get("station_context", {}), "controllers": CONTROLLER_PROFILES, "access_required": bool(ACCESS_CODE), "authorized": state.get("authorized", False)})
+        return session_response(request, {**settings, "flight_plan": state.get("flight_plan", {}), "validation": plan_validation(state.get("flight_plan", {})), "station": state.get("station_context", {}), "operation": operation_snapshot(state), "controllers": CONTROLLER_PROFILES, "access_required": bool(ACCESS_CODE), "authorized": state.get("authorized", False)})
     body = await request.json()
     for key in ("simbrief_id", "callsign", "gate", "arrival_gate", "airport"):
         if key in body:
@@ -761,7 +923,29 @@ async def api_settings(request):
     station = refresh_station_context(state, force=True)
     known_frequency = (station.get("frequencies") or {}).get(settings["controller_type"], "")
     settings["controller_frequency"] = str(known_frequency or "")
-    return session_response(request, {"ok": True, "settings": settings, "station": station})
+    return session_response(request, {"ok": True, "settings": settings, "station": station, "operation": operation_snapshot(state), "flight_plan": state.get("flight_plan", {}), "validation": plan_validation(state.get("flight_plan", {}))})
+
+
+async def api_operation(request):
+    state = session_for(request)
+    body = await request.json()
+    mode = str(body.get("mode") or state["operation"].get("mode") or "DEPARTURE").upper()
+    if mode not in ("DEPARTURE", "ARRIVAL"):
+        return session_response(request, {"error": "invalid_operation_mode"}, 400)
+    state["operation"]["mode"] = mode
+    state["settings"]["controller_type"] = ""
+    state["settings"]["controller_frequency"] = ""
+    plan = state.get("flight_plan", {})
+    if mode == "ARRIVAL":
+        if plan.get("destination"):
+            state["settings"]["airport"] = plan["destination"]
+        transition_operation(state, "ARRIVAL_CHECKIN", "Arrival operation selected; report position and destination ATIS to Approach or Tower.")
+    else:
+        if plan.get("origin"):
+            state["settings"]["airport"] = plan["origin"]
+        transition_operation(state, "PRE_FLIGHT", "Departure operation selected; request ATIS or clearance when ready.")
+    refresh_station_context(state, force=True)
+    return session_response(request, {"ok": True, "operation": operation_snapshot(state), "station": state.get("station_context", {})})
 
 
 async def api_flight_plan_sync(request):
@@ -787,7 +971,7 @@ async def api_flight_plan_sync(request):
     if plan.get("callsign"):
         state["settings"]["callsign"] = plan["callsign"]
     state["last_context_refresh"] = time.time()
-    return session_response(request, {"ok": True, "flight_plan": plan, "validation": plan_validation(plan), "station": state.get("station_context", {})})
+    return session_response(request, {"ok": True, "flight_plan": plan, "validation": plan_validation(plan), "station": state.get("station_context", {}), "operation": operation_snapshot(state)})
 
 
 async def api_flight_plan_validate(request):
@@ -795,7 +979,7 @@ async def api_flight_plan_validate(request):
     refreshed = refresh_live_context(state, force=True)
     station = refresh_station_context(state, force=True)
     plan = state.get("flight_plan", {})
-    return session_response(request, {"flight_plan": plan, "validation": plan_validation(plan), "station": station, "context_refreshed": refreshed or bool(station)})
+    return session_response(request, {"flight_plan": plan, "validation": plan_validation(plan), "station": station, "context_refreshed": refreshed or bool(station), "operation": operation_snapshot(state)})
 
 
 async def api_airports(request):
@@ -863,6 +1047,7 @@ async def api_session(request):
         "validation": plan_validation(state.get("flight_plan", {})),
         "airport": state["settings"].get("airport"),
         "controller_type": state["settings"].get("controller_type"),
+        "operation": operation_snapshot(state),
     })
 
 
@@ -871,6 +1056,7 @@ routes = [
     Route("/healthz", api_health),
     Route("/api/chat", api_chat, methods=["POST"]),
     Route("/api/settings", api_settings, methods=["GET", "POST"]),
+    Route("/api/operation", api_operation, methods=["POST"]),
     Route("/api/flight-plan/sync", api_flight_plan_sync, methods=["POST"]),
     Route("/api/flight-plan/validate", api_flight_plan_validate, methods=["POST"]),
     Route("/api/session", api_session),
