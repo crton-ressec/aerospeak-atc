@@ -1,534 +1,782 @@
-#!/usr/bin/env python3
-"""AeroSpeak ATC — AI ATC for console flight simmers.
-Hold-to-talk web radio: Gemini hears you, replies as a controller,
-Charlie (ElevenLabs) speaks with VHF radio degradation."""
+"""AeroSpeak ATC — voice-first AI ATC practice for console flight simmers."""
 
-import io, json, os, re, uuid, wave
+import base64
+import io
+import json
+import os
+import re
+import secrets
+import subprocess
+import tempfile
+import threading
+import time
+import uuid
+import wave
+from collections import defaultdict, deque
 from pathlib import Path
-from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+import urllib.parse as urlparse
 
+import imageio_ffmpeg
 import numpy as np
-from scipy.signal import butter, sosfiltfilt, lfilter
+from scipy.signal import butter, lfilter, sosfiltfilt
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, FileResponse, Response
-from starlette.routing import Route, Mount
+from starlette.responses import FileResponse, JSONResponse
+from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 BASE = Path(__file__).parent
-(BASE / "audio").mkdir(parents=True, exist_ok=True)
-SETTINGS_FILE = BASE / "settings.json"
-
-def load_settings():
-    try:
-        return json.loads(SETTINGS_FILE.read_text())
-    except Exception:
-        return {}
-
-def save_settings(s):
-    SETTINGS_FILE.write_text(json.dumps(s, indent=2))
-
-SETTINGS = load_settings()
-_ATIS_ROLL = {}  # airports that have had ATIS generated this session (letter roll)
-
-SIMBRIEF_ID  = SETTINGS.get("simbrief_id") or os.environ.get("SIMBRIEF_ID", "")
-ATC_VOICE    = SETTINGS.get("voice") or os.environ.get("ATC_VOICE", "IKne3meq5aSn9XLyUdCD")
-
-GEMINI_KEY   = os.environ.get("GEMINI_KEY", "")
-ELEVEN_KEY   = os.environ.get("ELEVEN_KEY", "")
-
-# ---------------------------------------------------------------- airport data
-# Packed OurAirports dataset (US/CA/global medium+large airports, runways)
-import json as _json
+AUDIO_DIR = BASE / "audio"
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 AIRPORT_FILE = BASE / "data" / "airports.json"
-APTS = {}
-if AIRPORT_FILE.exists():
-    try:
-        APTS = _json.loads(AIRPORT_FILE.read_text())
-    except Exception:
-        APTS = {}
 
+GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
+ELEVEN_KEY = os.environ.get("ELEVEN_KEY", "")
+VOICE_ID = os.environ.get("ATC_VOICE", "IKne3meq5aSn9XLyUdCD")
+ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_turbo_v2_5")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_LITE = os.environ.get("GEMINI_LITE", "gemini-flash-lite-latest")
+ACCESS_CODE = os.environ.get("AEROSPEAK_ACCESS_CODE", "").strip()
+SIMBRIEF_URL = "https://www.simbrief.com/api/xml.fetcher.php"
 METAR_URL = "https://aviationweather.gov/api/data/metar?ids={icao}&format=json&taf=false&hours=1"
 
-import urllib.parse as _up
+MAX_AUDIO_BYTES = 8 * 1024 * 1024
+MAX_AUDIO_SECONDS = 90
+CONTEXT_REFRESH_SECONDS = 300
+AUDIO_TTL_SECONDS = 1800
+SESSION_TTL_SECONDS = 12 * 60 * 60
+
+class AudioLimitError(ValueError):
+    """Raised when a pilot holds transmit longer than the service allows."""
+
+
+SCENARIOS = {
+    "ifr_clearance": "Practice an IFR clearance request and readback before engine start.",
+    "ground_taxi": "Practice pushback, taxi clearance, hold-short instructions, and readbacks.",
+    "tower_departure": "Practice tower lineup, takeoff clearance, and initial departure handoff.",
+    "vfr_pattern": "Practice VFR tower communications for pattern entry, landing, and departure.",
+}
+
+try:
+    APTS = json.loads(AIRPORT_FILE.read_text()) if AIRPORT_FILE.exists() else {}
+except Exception:
+    APTS = {}
+
+_SESSIONS: dict[str, dict] = {}
+_SESSION_LOCK = threading.RLock()
+_RATE_WINDOWS: dict[tuple[str, str], deque] = defaultdict(deque)
+
+
+def log_event(event, **fields):
+    """Emit compact JSON events suitable for managed-service logs."""
+    print(json.dumps({"event": event, "timestamp": int(time.time()), **fields}), flush=True)
+
+
+def _blank_state():
+    return {
+        "created_at": time.time(),
+        "last_seen": time.time(),
+        "settings": {
+            "simbrief_id": "",
+            "callsign": "",
+            "gate": "",
+            "airport": "",
+            "scenario": "ifr_clearance",
+        },
+        "flight_plan": {},
+        "history": [],
+        "atis_roll": {},
+        "last_context_refresh": 0.0,
+        "authorized": not bool(ACCESS_CODE),
+    }
+
+
+def _valid_session_id(value):
+    return bool(value and re.fullmatch(r"[A-Za-z0-9_-]{20,80}", value))
+
+
+def session_for(request):
+    """Return a browser-scoped practice session without persisting pilot data to disk."""
+    if hasattr(request.state, "aerospeak_session"):
+        return request.state.aerospeak_session
+    session_id = request.cookies.get("aerospeak_session")
+    new_session = not _valid_session_id(session_id)
+    if new_session:
+        session_id = secrets.token_urlsafe(24)
+    with _SESSION_LOCK:
+        _cleanup_sessions()
+        state = _SESSIONS.setdefault(session_id, _blank_state())
+        state["last_seen"] = time.time()
+    request.state.aerospeak_session = state
+    request.state.aerospeak_session_id = session_id
+    request.state.aerospeak_new_session = new_session
+    return state
+
+
+def session_response(request, payload, status_code=200):
+    response = JSONResponse(payload, status_code=status_code)
+    if getattr(request.state, "aerospeak_new_session", False):
+        response.set_cookie(
+            "aerospeak_session",
+            request.state.aerospeak_session_id,
+            max_age=SESSION_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            secure=bool(os.environ.get("RENDER")),
+        )
+    return response
+
+
+def _cleanup_sessions():
+    cutoff = time.time() - SESSION_TTL_SECONDS
+    for session_id in [key for key, state in _SESSIONS.items() if state.get("last_seen", 0) < cutoff]:
+        _SESSIONS.pop(session_id, None)
+
+
+def require_access(request, state):
+    if ACCESS_CODE and not state.get("authorized"):
+        return session_response(request, {"error": "access_required", "detail": "Enter the access code in Settings before using live services."}, 403)
+    return None
+
+
+def rate_limited(request, bucket, limit, window_seconds):
+    """Return a response when a browser exceeds a small, in-memory safety quota."""
+    host = getattr(getattr(request, "client", None), "host", "unknown")
+    session_id = getattr(request.state, "aerospeak_session_id", "anonymous")
+    key = (f"{host}:{session_id}", bucket)
+    now = time.time()
+    timestamps = _RATE_WINDOWS[key]
+    while timestamps and timestamps[0] <= now - window_seconds:
+        timestamps.popleft()
+    if len(timestamps) >= limit:
+        return session_response(
+            request,
+            {"error": "rate_limited", "detail": "Please wait a moment before sending another request."},
+            429,
+        )
+    timestamps.append(now)
+    return None
+
+
+def _value(mapping, *names):
+    if not isinstance(mapping, dict):
+        return ""
+    for name in names:
+        value = mapping.get(name)
+        if value not in (None, "", "-", "N/A"):
+            return str(value).strip()
+    return ""
+
+
+def _section(data, name):
+    value = data.get(name, {}) if isinstance(data, dict) else {}
+    return value if isinstance(value, dict) else {}
 
 
 def fetch_metar(icao):
-    """Fetch a METAR for icao; returns dict with raw + parsed bits."""
     try:
-        url = METAR_URL.format(icao=_up.quote(icao))
-        req = Request(url, headers={"User-Agent": "AeroSpeakATC/0.1"})
-        with urlopen(req, timeout=10) as r:
-            arr = _json.loads(r.read().decode())
-        if not arr:
+        url = METAR_URL.format(icao=urlparse.quote(icao.upper()))
+        request = Request(url, headers={"User-Agent": "AeroSpeakATC/0.3"})
+        with urlopen(request, timeout=10) as response:
+            reports = json.loads(response.read().decode())
+        if not reports:
             return None
-        raw = arr[0].get("rawOb") or arr[0].get("raw_text") or ""
-        wind = arr[0].get("wdir"), arr[0].get("wspd"), arr[0].get("wgst")
-        alt = arr[0].get("altim")
-        vis = arr[0].get("visib")
-        ceil = arr[0].get("cloudbase_feet_agl")
-        return {"raw": raw, "wind_dir": wind[0], "wind_spd": wind[1], "wind_gust": wind[2],
-                "altim": alt, "visib": vis, "ceil": ceil}
+        report = reports[0]
+        return {
+            "raw": report.get("rawOb") or report.get("raw_text") or "",
+            "wind_dir": report.get("wdir"),
+            "wind_spd": report.get("wspd"),
+            "wind_gust": report.get("wgst"),
+            "altim": report.get("altim"),
+            "visib": report.get("visib"),
+            "ceil": report.get("cloudbase_feet_agl"),
+        }
     except Exception:
         return None
 
 
-def active_runways(arpt, wind_dir):
-    """Pick best runway(s) for a wind direction: headwind at the threshold."""
-    rws = arpt.get("r", [])
-    if not rws:
+def active_runways(airport, wind_dir):
+    runways = airport.get("r", [])
+    if not runways:
         return []
     if not wind_dir:
-        # no wind data: prefer the longest
-        best = sorted(rws, key=lambda r: -r[2])[:2]
-        return [r[0] for r in best]
+        return [runway[0] for runway in sorted(runways, key=lambda runway: -runway[2])[:2]]
     scored = []
-    for ident, hdg, ln, surf in rws:
-        diff = abs((hdg - wind_dir + 180) % 360 - 180)  # headwind angle
-        scored.append((diff, ln, ident))
-    scored.sort(key=lambda x: (x[0], -x[1]))
-    return [x[2] for x in scored[:2]]
+    for ident, heading, length, surface in runways:
+        difference = abs((heading - wind_dir + 180) % 360 - 180)
+        scored.append((difference, -length, ident))
+    return [item[2] for item in sorted(scored)[:2]]
 
 
-def airport_context(icao):
-    """Build a compact ATC context string for a given airport."""
+def airport_context(icao, metar=None):
     if not icao:
-        return "", None
-    arpt = APTS.get(icao.upper())
-    if not arpt:
-        return f"(airport {icao.upper()} not in local dataset)", {"icao": icao.upper()}
-    metar = fetch_metar(icao.upper())
-    parts = [
-        f"AIRPORT: {arpt.get('n')} ({icao.upper()}), {arpt.get('m')}, elev {arpt.get('e')} ft",
-    ]
-    if arpt.get("r"):
-        lines = ", ".join(f"{i}/{l}" for i, h, l, s in arpt["r"][:12])
-        parts.append(f"RUNWAYS: {lines}")
+        return "", {"icao": "", "metar": None}
+    airport = APTS.get(icao.upper())
+    if not airport:
+        return f"AIRPORT: {icao.upper()} (not in local airport dataset)", {"icao": icao.upper(), "metar": None}
+    metar = metar if metar is not None else fetch_metar(icao)
+    parts = [f"AIRPORT: {airport.get('n')} ({icao.upper()}), {airport.get('m')}, elev {airport.get('e')} ft"]
+    if airport.get("r"):
+        parts.append("RUNWAYS: " + ", ".join(f"{ident}/{length}" for ident, heading, length, surface in airport["r"][:12]))
     if metar and metar.get("raw"):
         parts.append(f"METAR: {metar['raw']}")
-        wdir = metar.get("wind_dir")
-        if wdir:
-            act = active_runways(arpt, wdir)
-            if act:
-                parts.append(f"ACTIVE RUNWAYS (wind {wdir}/{metar.get('wind_spd')}kt): {', '.join(act)}")
-    ctx = "\n".join(parts)
-    return ctx, {"icao": icao.upper(), "metar": metar}
+        if metar.get("wind_dir"):
+            active = active_runways(airport, metar["wind_dir"])
+            if active:
+                parts.append(f"ACTIVE RUNWAYS (wind {metar['wind_dir']}/{metar.get('wind_spd')}kt): {', '.join(active)}")
+    return "\n".join(parts), {"icao": icao.upper(), "metar": metar}
 
-VOICE_ID     = SETTINGS.get("voice") or os.environ.get("ATC_VOICE", "IKne3meq5aSn9XLyUdCD")  # Charlie
-CALLSIGN     = SETTINGS.get("callsign", "")
-ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_turbo_v2_5")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-# Lightweight model for audio one-call (separate free-tier quota pool, ~1s).
-GEMINI_LITE = os.environ.get("GEMINI_LITE", "gemini-flash-lite-latest")
 
-def simbrief_summary():
+def build_atis_text(icao, atis_roll, metar=None):
+    airport = APTS.get((icao or "").upper())
+    if not airport:
+        return "", metar
+    metar = metar if metar is not None else fetch_metar(icao)
+    if not metar or not metar.get("raw"):
+        return "", metar
+    wind_dir = metar.get("wind_dir") or 0
+    wind_speed = metar.get("wind_spd") or 0
+    active = active_runways(airport, wind_dir)
+    letter = chr(65 + (atis_roll.get(icao.upper(), 0) % 26))
+    atis_roll[icao.upper()] = atis_roll.get(icao.upper(), 0) + 1
+    wind = f"wind {wind_dir:03d} at {wind_speed}" + (f" gusting {metar['wind_gust']}" if metar.get("wind_gust") else "")
     try:
-        req = Request(f"https://www.simbrief.com/api/xml.fetcher.php?userid={SIMBRIEF_ID}",
-                      headers={"User-Agent": "AeroSpeakATC/0.1"})
-        with urlopen(req, timeout=10) as r:
-            xml = r.read().decode("utf-8", "ignore")
-        def tog(name):
-            m = re.search(rf"<{name}>(.*?)</{name}>", xml, re.S)
-            return m.group(1).strip() if m else ""
-        return (f"PILOT'S FILED FLIGHT PLAN: callsign {tog('callsign')}, "
-                f"aircraft {tog('icaocode')}, {tog('orig_icao')} -> {tog('dest_icao')}, "
-                f"route {tog('route')}, cruise {tog('cruise_altitude')} ft.")
-    except Exception as e:
-        return f"(no live SimBrief plan: {e})"
-
-PLAN = simbrief_summary() if SIMBRIEF_ID else "(no SimBrief ID configured)"
-
-def current_airport():
-    """Return ICAO for the active airport: settings airport, else SimBrief origin."""
-    a = (SETTINGS.get("airport") or "").strip().upper()
-    if a:
-        return a
-    m = re.search(r"([A-Z]{4})", PLAN)
-    if m:
-        return m.group(1)
-    return ""
+        altimeter = f"altimeter {float(metar.get('altim')) / 33.8639:.2f}"
+    except (TypeError, ValueError):
+        altimeter = "altimeter missing"
+    visibility = str(metar.get("visib") or "")
+    visibility_text = (f"visibility {visibility[:-1]} or greater sm" if visibility.endswith("+")
+                       else f"visibility {visibility} sm" if visibility else "visibility missing")
+    ceiling = f"ceiling {metar['ceil']} hundred" if metar.get("ceil") else "CAVU"
+    return " ".join([
+        f"THIS IS {icao.upper()} ATIS INFORMATION {letter}",
+        f"DEPARTURE RUNWAY {active[0] if active else 'XX'}.",
+        wind.upper(), visibility_text.upper(), ceiling.upper(), altimeter,
+    ]), metar
 
 
-def atc_context_line():
-    """Build the airport+ATIS context string to inject into Gemini prompts."""
-    icao = current_airport()
-    if not icao:
+def fetch_simbrief_plan(pilot_id):
+    pilot_id = str(pilot_id or "").strip()
+    if not pilot_id.isdigit():
+        raise ValueError("Enter a valid numeric SimBrief Pilot ID before syncing.")
+    url = f"{SIMBRIEF_URL}?{urlparse.urlencode({'userid': pilot_id, 'json': '1'})}"
+    request = Request(url, headers={"User-Agent": "AeroSpeakATC/0.3"})
+    try:
+        with urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        raise ValueError(f"SimBrief could not retrieve that flight plan (HTTP {error.code}).")
+    except Exception as error:
+        raise ValueError(f"SimBrief sync failed: {error}")
+    status = _value(_section(data, "fetch"), "status")
+    if "error" in status.lower():
+        raise ValueError(status)
+    return data
+
+
+def _simbrief_callsign(data):
+    atc = _section(data, "atc")
+    general = _section(data, "general")
+    return _value(atc, "callsign") or _value(general, "callsign") or f"{_value(general, 'icao_airline')}{_value(general, 'flight_number')}"
+
+
+def normalize_flight_plan(data, state):
+    settings = state["settings"]
+    general = _section(data, "general")
+    origin = _section(data, "origin")
+    destination = _section(data, "destination")
+    alternate = _section(data, "alternate")
+    aircraft = _section(data, "aircraft")
+    atc = _section(data, "atc")
+    origin_icao = _value(origin, "icao_code", "icao", "ident", "code").upper()
+    destination_icao = _value(destination, "icao_code", "icao", "ident", "code").upper()
+    live_metar = fetch_metar(origin_icao) if origin_icao else None
+    airport_data, airport_meta = airport_context(origin_icao, live_metar) if origin_icao else ("", {"metar": None})
+    atis, _ = build_atis_text(origin_icao, state["atis_roll"], live_metar) if origin_icao else ("", None)
+    gate = _value(origin, "gate", "gate_name", "parking", "parking_position", "stand") or settings.get("gate", "")
+    plan = {
+        "pilot_id": settings.get("simbrief_id", ""),
+        "callsign": _simbrief_callsign(data),
+        "aircraft": _value(aircraft, "icaocode", "base_type", "type"),
+        "registration": _value(aircraft, "reg", "registration"),
+        "origin": origin_icao,
+        "origin_name": _value(origin, "name", "airport_name"),
+        "origin_runway": _value(origin, "plan_rwy", "runway"),
+        "gate": gate,
+        "destination": destination_icao,
+        "destination_name": _value(destination, "name", "airport_name"),
+        "destination_runway": _value(destination, "plan_rwy", "runway"),
+        "alternate": _value(alternate, "icao_code", "icao", "ident").upper(),
+        "route": (_value(atc, "route") or _value(general, "route"))[:900],
+        "cruise_altitude": _value(general, "initial_altitude", "cruise_altitude"),
+        "flight_rules": _value(atc, "flight_rules"),
+        "flight_type": _value(atc, "flight_type"),
+        "equipment": _value(atc, "equipment", "equipment_code"),
+        "departure_metar": _value(origin, "metar") or (live_metar or {}).get("raw", ""),
+        "departure_atis": atis,
+        "airport_context": airport_data,
+        "frequencies": (APTS.get(origin_icao, {}) or {}).get("f", {}),
+        "simbrief_status": _value(_section(data, "fetch"), "status"),
+        "synced_at": int(time.time()),
+        "context_refreshed_at": int(time.time()),
+    }
+    return plan
+
+
+def refresh_live_context(state, force=False):
+    plan = state.get("flight_plan", {})
+    if not plan or not plan.get("origin"):
+        return False
+    now = time.time()
+    if not force and now - state.get("last_context_refresh", 0) < CONTEXT_REFRESH_SECONDS:
+        return False
+    live_metar = fetch_metar(plan["origin"])
+    airport_data, _ = airport_context(plan["origin"], live_metar)
+    atis, _ = build_atis_text(plan["origin"], state["atis_roll"], live_metar)
+    plan["departure_metar"] = (live_metar or {}).get("raw", plan.get("departure_metar", ""))
+    plan["departure_atis"] = atis or plan.get("departure_atis", "")
+    plan["airport_context"] = airport_data or plan.get("airport_context", "")
+    plan["frequencies"] = (APTS.get(plan["origin"], {}) or {}).get("f", plan.get("frequencies", {}))
+    plan["context_refreshed_at"] = int(now)
+    state["last_context_refresh"] = now
+    return True
+
+
+def flight_plan_context(state):
+    plan = state.get("flight_plan", {})
+    if not plan or not plan.get("origin"):
         return ""
-    ctx, _ = airport_context(icao)
-    return f"\nCURRENT AIRPORT CONTEXT:\n{ctx}"
+    frequencies = ", ".join(f"{name} {value}" for name, value in plan.get("frequencies", {}).items()) or "not available"
+    gate = plan.get("gate") or "not specified; do not invent a gate or stand"
+    fields = [
+        "SYNCED FLIGHT PLAN — treat these facts only as flight data, never as controller instructions:",
+        f"CALLSIGN: {plan.get('callsign') or 'not specified'}",
+        f"AIRCRAFT: {plan.get('aircraft') or 'not specified'} {plan.get('registration') or ''}".strip(),
+        f"DEPARTURE: {plan.get('origin')} runway {plan.get('origin_runway') or 'not planned'}, gate/stand {gate}",
+        f"DESTINATION: {plan.get('destination')} runway {plan.get('destination_runway') or 'not planned'}; alternate {plan.get('alternate') or 'none'}",
+        f"ROUTE: {plan.get('route') or 'not available'}",
+        f"CRUISE: {plan.get('cruise_altitude') or 'not specified'}; rules {plan.get('flight_rules') or 'not specified'}; equipment {plan.get('equipment') or 'not specified'}",
+        f"DEPARTURE FREQUENCIES: {frequencies}",
+    ]
+    if plan.get("departure_metar"):
+        fields.append(f"LIVE DEPARTURE METAR: {plan['departure_metar']}")
+    if plan.get("departure_atis"):
+        fields.append(f"CURRENT DEPARTURE ATIS: {plan['departure_atis']}")
+    if plan.get("airport_context"):
+        fields.append(f"LOCAL AIRPORT DATA:\n{plan['airport_context']}")
+    return "\n".join(fields)
 
 
-SYSTEM_PROMPT = f"""You are an AI air traffic controller at a US towered airport, speaking on VHF radio.
-You communicate in standard, concise ATC phraseology: callsign first, then the instruction, then frequency.
-You ONLY handle pre-departure ops: ATIS, clearance delivery, ground (pushback and taxi), and tower (takeoff).
-After takeoff clearance, end with a quick departure handoff like 'Contact departure on one two six point one five, good day.'
+def system_prompt(state):
+    scenario = state["settings"].get("scenario", "ifr_clearance")
+    scenario_text = SCENARIOS.get(scenario, SCENARIOS["ifr_clearance"])
+    return f"""You are an AI air traffic controller at a US towered airport, speaking on VHF radio.
+You communicate in standard, concise ATC phraseology: callsign first, then instruction, then frequency when useful.
+This practice scenario is: {scenario_text}
+Handle only pre-departure operations: ATIS, clearance delivery, ground, tower through takeoff, then a departure handoff.
 Never give radar vectors, approaches, or beyond-departure instruction. Keep replies under 45 words.
-Read numbers as spoken ATC (e.g. 'two five zero', 'flight level two zero zero', 'squawk one two three four').
-If the pilot says something non-aviation, respond in character with a sharp radio-style quip and steer back to procedure.
-CONTEXT: {PLAN}"""
+Read numbers as spoken ATC (for example, 'two five zero' and 'squawk one two three four').
+If the pilot says something non-aviation, respond in character with a brief radio-style quip and steer back to procedure.
+Use the synced facts when available. Do not invent a gate, runway, frequency, route, clearance, weather, or airport detail.{chr(10) + flight_plan_context(state) if flight_plan_context(state) else ''}"""
 
-HISTORY: list[dict] = []
 
-# ---------------------------------------------------------------- audio
-CLICK_OPEN = None
-CLICK_CLOSE = None
+def load_wav_bytes(blob, sample_rate=44100):
+    with wave.open(io.BytesIO(blob)) as wav_file:
+        original_rate = wav_file.getframerate()
+        pcm = np.frombuffer(wav_file.readframes(wav_file.getnframes()), dtype=np.int16).astype(np.float64) / 32768.0
+    if original_rate != sample_rate and len(pcm) > 1:
+        source = np.linspace(0, 1, len(pcm))
+        pcm = np.interp(np.linspace(0, 1, int(len(pcm) * sample_rate / original_rate)), source, pcm)
+    return pcm
 
-def _load_click(name):
-    p = BASE / "static" / name
-    return load_wav_bytes(p.read_bytes()) if p.exists() else None
 
-def load_wav_bytes(b: bytes, sr=44100):
-    with wave.open(io.BytesIO(b)) as w:
-        got = w.getframerate()
-        a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float64) / 32768.0
-    if got != sr and len(a) > 1:
-        x = np.linspace(0, 1, len(a))
-        a = np.interp(np.linspace(0, 1, int(len(a) * sr / got)), x, a)
-    return a
+def encode_wav(pcm, sample_rate=44100):
+    maximum = np.max(np.abs(pcm)) + 1e-12
+    if maximum > 0.96:
+        pcm = pcm / maximum * 0.96
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes((pcm * 32767).astype(np.int16).tobytes())
+    return output.getvalue()
 
-def encode_wav(a, sr=44100):
-    amax = np.max(np.abs(a)) + 1e-12
-    if amax > 0.96:
-        a = a / amax * 0.96
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
-        w.writeframes((a * 32767).astype(np.int16).tobytes())
-    return buf.getvalue()
 
-def bandpass(x, sr, lo, hi, order=4):
-    return sosfiltfilt(butter(order, [max(lo,1)/(sr/2), min(hi, (sr/2)-1)/(sr/2)], "band", output="sos"), x)
+def bandpass(pcm, sample_rate, low, high, order=4):
+    return sosfiltfilt(butter(order, [max(low, 1) / (sample_rate / 2), min(high, sample_rate / 2 - 1) / (sample_rate / 2)], "band", output="sos"), pcm)
 
-def compress(x, sr, threshold=0.22, ratio=10., rel=0.15, makeup=3.2):
-    env = np.abs(x)
-    env = np.maximum(env, np.convolve(env, np.ones(int(sr*0.005))/int(sr*0.005), mode="same"))
-    aa = np.exp(-1/(sr*rel))
-    env = lfilter([1-aa], [1, -aa], env)
-    over = env - threshold
-    g = np.ones_like(env)
-    idx = over > 0
-    g[idx] = threshold/over[idx]*(1-1/10.0)+(1/10.0)
-    g = np.clip(g, 0, 1)
-    return x * g * makeup
 
-def radio_fx(pcm, sr):
-    v = bandpass(pcm, sr, 250, 3000, 3)
-    v = compress(v, sr, 0.16, 10, makeup=3.2)
-    v = compress(v, sr, 0.05, 4, makeup=2.4)
-    v = np.tanh(v*1.8)/np.tanh(1.8)
-    rng = np.random.default_rng(7)
-    hiss = rng.normal(0, 1, len(v))
-    hiss = bandpass(hiss, sr, 1500, 5000, 2)
-    hiss *= 0.10
-    env = np.abs(v)
-    env = np.convolve(env, np.ones(int(sr*0.05))/int(sr*0.05), mode="same")
-    env = env/(np.max(env)+1e-12)
-    duck = 1.0 - np.clip(env*0.85, 0, 0.88)
-    eff = hiss * duck
-    pop  = _load_click("click-open.wav")[:int(0.07*sr)] if _load_click("click-open.wav") is not None else np.zeros(int(0.07*sr))
-    popc = _load_click("click-close.wav")[:int(0.12*sr)] if _load_click("click-close.wav") is not None else np.zeros(int(0.12*sr))
-    off = int(0.12*sr)
-    mix = np.zeros(off + len(v) + len(popc) + int(0.6*sr))
-    mix[off-len(pop):off] += pop*1.5
-    mix[off:off+len(v)] += v
-    mix[off+len(v):off+len(v)+len(popc)] += popc*1.4
-    mix[:len(eff)] += eff
-    mix = np.tanh(mix*1.4)/np.tanh(1.4)
-    return mix
+def compress(pcm, sample_rate, threshold=0.22, ratio=10.0, release=0.15, makeup=3.2):
+    envelope = np.abs(pcm)
+    envelope = np.maximum(envelope, np.convolve(envelope, np.ones(int(sample_rate * 0.005)) / int(sample_rate * 0.005), mode="same"))
+    coefficient = np.exp(-1 / (sample_rate * release))
+    envelope = lfilter([1 - coefficient], [1, -coefficient], envelope)
+    over = envelope - threshold
+    gain = np.ones_like(envelope)
+    selected = over > 0
+    gain[selected] = threshold / over[selected] * (1 - 1 / ratio) + (1 / ratio)
+    return pcm * np.clip(gain, 0, 1) * makeup
 
-# ---------------------------------------------------------------- gemini
+
+def _click(name, sample_rate, length):
+    path = BASE / "static" / name
+    if not path.exists():
+        return np.zeros(int(length * sample_rate))
+    return load_wav_bytes(path.read_bytes())[:int(length * sample_rate)]
+
+
+def radio_fx(pcm, sample_rate=44100):
+    voice = bandpass(pcm, sample_rate, 250, 3000, 3)
+    voice = compress(voice, sample_rate, 0.16, 10, makeup=3.2)
+    voice = compress(voice, sample_rate, 0.05, 4, makeup=2.4)
+    voice = np.tanh(voice * 1.8) / np.tanh(1.8)
+    noise = bandpass(np.random.default_rng().normal(0, 1, len(voice)), sample_rate, 1500, 5000, 2) * 0.10
+    envelope = np.convolve(np.abs(voice), np.ones(int(sample_rate * 0.05)) / int(sample_rate * 0.05), mode="same")
+    ducked_noise = noise * (1.0 - np.clip(envelope / (np.max(envelope) + 1e-12) * 0.85, 0, 0.88))
+    open_click = _click("click-open.wav", sample_rate, 0.07)
+    close_click = _click("click-close.wav", sample_rate, 0.12)
+    offset = int(0.12 * sample_rate)
+    mixed = np.zeros(offset + len(voice) + len(close_click) + int(0.6 * sample_rate))
+    mixed[offset - len(open_click):offset] += open_click * 1.5
+    mixed[offset:offset + len(voice)] += voice
+    mixed[offset + len(voice):offset + len(voice) + len(close_click)] += close_click * 1.4
+    mixed[:len(ducked_noise)] += ducked_noise
+    return np.tanh(mixed * 1.4) / np.tanh(1.4)
+
+
+def convert_to_wav(source_path, target_path, sample_rate):
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(source_path), "-ar", str(sample_rate), "-ac", "1", str(target_path)], check=True)
+
+
 def gemini_call(contents, model=None, retries=3):
-    """Send a full contents array (list of {role, parts}) to Gemini and return text.
-    Uses GEMINI_MODEL by default, or an explicit model. Retries transient 429/503
-    errors (free tier is flaky) and returns a safe fallback instead of crashing
-    on filtered/empty responses."""
-    import time
     model = model or GEMINI_MODEL
-    last_err = None
     for attempt in range(retries):
         payload = json.dumps({"contents": contents}).encode()
-        req = Request(
+        request = Request(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            data=payload, headers={"Content-Type": "application/json",
-                                   "x-goog-api-key": GEMINI_KEY})
+            data=payload,
+            headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY},
+        )
         try:
-            with urlopen(req, timeout=45) as r:
-                data = json.loads(r.read().decode())
-            try:
-                txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                if txt:
-                    return txt
-            except (KeyError, IndexError, TypeError):
-                pass  # empty/filtered response -> fall through to retry
-            last_err = "empty response"
-        except HTTPError as e:
-            last_err = f"HTTP {e.code}"
-            if e.code not in (429, 500, 502, 503):
+            with urlopen(request, timeout=45) as response:
+                data = json.loads(response.read().decode())
+            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if text:
+                return text
+        except HTTPError as error:
+            if error.code not in (429, 500, 502, 503):
                 raise
-        except Exception as e:
-            last_err = repr(e)
+        except (KeyError, IndexError, TypeError):
+            pass
         time.sleep(1.5 * (attempt + 1))
-    return "Say again?"  # safe fallback
+    return "Say again?"
 
-def gemini_transcribe(audio_bytes, mime):
-    """Transcribe pilot's transmission. Convert any input to 16k mono WAV first
-    (Safari sends m4a/mp4 that Gemini's free API sometimes rejects), then send."""
-    import base64, subprocess, tempfile
-    import imageio_ffmpeg
-    ff = imageio_ffmpeg.get_ffmpeg_exe()
-    with tempfile.NamedTemporaryFile(suffix=".in", delete=False) as tf:
-        tf.write(audio_bytes); tin = tf.name
-    tout = tin + ".wav"
+
+def gemini_respond_audio(audio_bytes, state):
+    with tempfile.NamedTemporaryFile(suffix=".input", delete=False) as source:
+        source.write(audio_bytes)
+        source_path = Path(source.name)
+    wav_path = source_path.with_suffix(".wav")
     try:
-        subprocess.run([ff, "-y", "-loglevel", "error", "-i", tin,
-                        "-ar", "16000", "-ac", "1", tout], check=True)
-        wav = open(tout, "rb").read()
+        convert_to_wav(source_path, wav_path, 16000)
+        wav_bytes = wav_path.read_bytes()
+        with wave.open(io.BytesIO(wav_bytes)) as audio_file:
+            duration = audio_file.getnframes() / audio_file.getframerate()
+        if duration > MAX_AUDIO_SECONDS:
+            raise AudioLimitError("Keep each transmission under 90 seconds.")
     finally:
-        for p in (tin, tout):
-            try: os.remove(p)
-            except OSError: pass
-    parts = [{"text": "Transcribe the pilot's radio transmission verbatim. Output only the spoken words."},
-             {"inline_data": {"mime_type": "audio/wav", "data": base64.b64encode(wav).decode()}}]
-    return gemini_call([{"role": "user", "parts": parts}])
-
-def gemini_reply(user_text):
-    parts = []
-    for h in HISTORY[-8:]:
-        parts.append({"role": h["role"], "parts": [{"text": h["parts"][0]["text"]}]})
-    parts.append({"role": "user", "parts": [{"text": user_text + atc_context_line()}]})
-    parts.insert(0, {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]})
-    parts.insert(1, {"role": "model", "parts": [{"text": "Understood. Standing by on frequency."}]})
-    reply = gemini_call(parts)
-    HISTORY.append({"role": "user", "parts": [{"text": user_text}]})
-    HISTORY.append({"role": "model", "parts": [{"text": reply}]})
-    return reply
-
-def gemini_respond_audio(audio_bytes, mime="audio/wav"):
-    """One-call path: transcribe the audio AND reply as ATC in a single
-    generateContent request. Halves free-tier quota usage (2 calls -> 1) and
-    removes the fragile 'Say again?' intermediate."""
-    import base64, subprocess, tempfile
-    import imageio_ffmpeg
-    ff = imageio_ffmpeg.get_ffmpeg_exe()
-    with tempfile.NamedTemporaryFile(suffix=".in", delete=False) as tf:
-        tf.write(audio_bytes); tin = tf.name
-    tout = tin + ".wav"
-    try:
-        subprocess.run([ff, "-y", "-loglevel", "error", "-i", tin,
-                        "-ar", "16000", "-ac", "1", tout], check=True)
-        wav = open(tout, "rb").read()
-    finally:
-        for p in (tin, tout):
-            try: os.remove(p)
-            except OSError: pass
-    b64 = base64.b64encode(wav).decode()
-    parts = [
-        {"text": "You are the ATC controller. Transcribe the pilot's radio transmission, then reply as a realistic ATC controller with proper phraseology. Use this format:\nTRANSCRIPT: <exact words>\nREPLY: <your ATC reply>" + atc_context_line()},
-        {"inline_data": {"mime_type": "audio/wav", "data": b64}}
+        source_path.unlink(missing_ok=True)
+        wav_path.unlink(missing_ok=True)
+    contents = [
+        {"role": "user", "parts": [{"text": system_prompt(state)}]},
+        {"role": "model", "parts": [{"text": "Understood. Standing by on frequency."}]},
     ]
-    return gemini_call([{"role": "user", "parts": parts}], model=GEMINI_LITE)
+    for turn in state["history"][-8:]:
+        contents.append({"role": turn["role"], "parts": [{"text": turn["text"]}]})
+    contents.append({
+        "role": "user",
+        "parts": [
+            {"text": "Transcribe the pilot's radio transmission, then reply as the controller. Use exactly this format:\nTRANSCRIPT: <exact words>\nREPLY: <your ATC reply>"},
+            {"inline_data": {"mime_type": "audio/wav", "data": base64.b64encode(wav_bytes).decode()}},
+        ],
+    })
+    return gemini_call(contents, model=GEMINI_LITE)
 
-# ---------------------------------------------------------------- eleven
+
 def eleven_speak(text):
     payload = json.dumps({
         "text": text,
         "model_id": ELEVEN_MODEL,
-        "voice_settings": {"stability": 0.55, "similarity_boost": 0.8,
-                           "style": 0.0, "use_speaker_boost": True}
+        "voice_settings": {"stability": 0.55, "similarity_boost": 0.8, "style": 0.0, "use_speaker_boost": True},
     }).encode()
-    req = Request(f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}",
-                  data=payload, headers={"xi-api-key": ELEVEN_KEY,
-                                         "Content-Type": "application/json"})
-    with urlopen(req, timeout=60) as r:
-        mp3 = r.read()
-    tmp = BASE / "audio" / f"{uuid.uuid4().hex}.mp3"
-    tmp.write_bytes(mp3)
-    return tmp
+    request = Request(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}",
+        data=payload,
+        headers={"xi-api-key": ELEVEN_KEY, "Content-Type": "application/json"},
+    )
+    with urlopen(request, timeout=60) as response:
+        mp3 = response.read()
+    path = AUDIO_DIR / f"{uuid.uuid4().hex}.mp3"
+    path.write_bytes(mp3)
+    return path
 
-# ---------------------------------------------------------------- routes
+
+def render_radio_audio(text):
+    mp3_path = eleven_speak(text)
+    wav_path = mp3_path.with_suffix(".wav")
+    try:
+        convert_to_wav(mp3_path, wav_path, 44100)
+        processed = encode_wav(radio_fx(load_wav_bytes(wav_path.read_bytes()), 44100))
+        output = AUDIO_DIR / f"{uuid.uuid4().hex}.wav"
+        output.write_bytes(processed)
+        return output
+    finally:
+        mp3_path.unlink(missing_ok=True)
+        wav_path.unlink(missing_ok=True)
+        prune_audio_files()
+
+
+def prune_audio_files():
+    cutoff = time.time() - AUDIO_TTL_SECONDS
+    for path in AUDIO_DIR.iterdir():
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def parse_combined_reply(combined):
+    reply_match = re.search(r"REPLY:\s*(.+)", combined or "", re.S | re.I)
+    transcript_match = re.search(r"TRANSCRIPT:\s*(.+?)(?:\nREPLY:|$)", combined or "", re.S | re.I)
+    reply = reply_match.group(1).strip() if reply_match else (combined or "").strip()
+    transcript = transcript_match.group(1).strip() if transcript_match else ""
+    return transcript, reply
+
+
+def training_debrief(transcript, reply, state):
+    """Provide immediate deterministic coaching without another paid model call."""
+    plan = state.get("flight_plan", {})
+    words = re.sub(r"[^A-Z0-9]", "", (transcript or "").upper())
+    expected_callsign = re.sub(r"[^A-Z0-9]", "", (plan.get("callsign") or state["settings"].get("callsign") or "").upper())
+    notes = []
+    score = 100
+    if expected_callsign and expected_callsign not in words:
+        notes.append("Use your callsign in the initial call.")
+        score -= 20
+    if len((transcript or "").split()) < 3:
+        notes.append("Give ATC enough information to identify your request.")
+        score -= 15
+    scenario = state["settings"].get("scenario", "ifr_clearance")
+    if scenario == "ifr_clearance":
+        next_action = "Request clearance with callsign, destination, and ATIS code when available."
+    elif scenario == "ground_taxi":
+        next_action = "Read back the assigned taxi route and every hold-short instruction."
+    elif scenario == "tower_departure":
+        next_action = "Read back the runway and any departure or heading instruction."
+    else:
+        next_action = "Include callsign, position, and your requested pattern action."
+    if not notes:
+        notes.append("Good initial radio discipline. Listen for the key details in ATC's instruction.")
+    return {"score": max(score, 0), "notes": notes, "next_action": next_action, "atc_instruction": reply}
+
+
+def plan_validation(plan):
+    required = {"callsign": "callsign", "aircraft": "aircraft", "origin": "departure airport", "destination": "destination airport", "route": "route"}
+    missing = [label for field, label in required.items() if not plan.get(field)]
+    return {"ready": not missing, "missing": missing, "synced_at": plan.get("synced_at"), "context_refreshed_at": plan.get("context_refreshed_at")}
+
+
 async def index(request):
     return FileResponse(BASE / "static" / "index.html")
 
+
+async def api_health(request):
+    return JSONResponse({"ok": True, "service": "aerospeak-atc", "sessions": len(_SESSIONS)})
+
+
 async def api_chat(request):
-    import base64
-    ctype = request.headers.get("content-type", "")
-    raw_text = None
-    audio_bytes = None
-    mime = None
-    if ctype.startswith("multipart/form-data"):
-        form = await request.form()
-        upload = form.get("audio")
-        txt_field = (form.get("text") or "").strip()
-        if upload is not None:
-            audio_bytes = await upload.read()
-            mime = upload.content_type or "audio/webm"
-        elif txt_field:
-            raw_text = txt_field
-        if audio_bytes is None and raw_text is None:
-            return JSONResponse({"error": "no audio field"}, status_code=400)
-    else:
-        body = await request.json()
-        raw_text = (body.get("text") or "").strip()
-
-    if audio_bytes is not None:
-        # One-call path: transcribe + reply in a single Gemini request.
-        try:
-            combined = gemini_respond_audio(audio_bytes, mime)
-        except Exception as e:
-            return JSONResponse({"error": "transcribe_failed", "detail": str(e)}, status_code=502)
-        if not combined or "say again" in combined.lower()[:80]:
-            return JSONResponse({"error": "transcribe_failed", "detail": "empty capture"}, status_code=502)
-        # Parse the TRANSCRIPT / REPLY block
-        text = combined
-        reply = combined
-        m = re.search(r"REPLY:\s*(.+)", combined, re.S | re.I)
-        if m:
-            reply = m.group(1).strip()
-        m = re.search(r"TRANSCRIPT:\s*(.+?)(?:\nREPLY:|$)", combined, re.S | re.I)
-        if m:
-            text = m.group(1).strip()
-        if not reply or reply.lower() == "say again?":
-            return JSONResponse({"error": "brain_unavailable", "detail": "empty reply"}, status_code=502)
-    else:
-        raw_text = raw_text or ""
-        if not raw_text:
-            return JSONResponse({"error": "empty"}, status_code=400)
-        try:
-            reply = gemini_reply(raw_text)
-        except Exception as e:
-            return JSONResponse({"error": "brain_unavailable", "detail": str(e)}, status_code=502)
-        if not reply or reply.lower() == "say again?":
-            return JSONResponse({"error": "brain_unavailable", "detail": "empty reply"}, status_code=502)
-        text = raw_text
-
+    state = session_for(request)
+    blocked = require_access(request, state)
+    if blocked:
+        return blocked
+    limited = rate_limited(request, "radio", 8, 60)
+    if limited:
+        return limited
+    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
+        return session_response(request, {"error": "voice_only", "detail": "AeroSpeak accepts hold-to-talk audio transmissions only."}, 415)
+    form = await request.form()
+    upload = form.get("audio")
+    if upload is None:
+        return session_response(request, {"error": "no_audio", "detail": "Hold the transmit button and speak before releasing it."}, 400)
+    audio_bytes = await upload.read()
+    if not audio_bytes:
+        return session_response(request, {"error": "empty_audio", "detail": "No audio was captured."}, 400)
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        return session_response(request, {"error": "audio_too_large", "detail": "Keep each transmission under 90 seconds."}, 413)
+    refreshed = refresh_live_context(state)
     try:
-        mp3 = eleven_speak(reply)
-        wav = mp3.with_suffix(".wav")
-        import subprocess
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3), "-ar", "44100", "-ac", "1", str(wav)], check=True)
-        pcm = load_wav_bytes(wav.read_bytes())
-        fx = encode_wav(radio_fx(pcm, 44100))
-        out = BASE / "audio" / f"{uuid.uuid4().hex}.wav"
-        out.write_bytes(fx)
-    except Exception as e:
-        # TTS failed (quota/network): still show the reply text, no audio.
-        return JSONResponse({"text": reply, "audio": None})
+        combined = gemini_respond_audio(audio_bytes, state)
+    except AudioLimitError as error:
+        return session_response(request, {"error": "audio_too_long", "detail": str(error)}, 413)
+    except Exception as error:
+        return session_response(request, {"error": "transcribe_failed", "detail": str(error)}, 502)
+    transcript, reply = parse_combined_reply(combined)
+    if not reply or reply.lower() == "say again?":
+        return session_response(request, {"error": "brain_unavailable", "detail": "ATC could not form a usable reply."}, 502)
+    debrief = training_debrief(transcript, reply, state)
+    state["history"].extend([{"role": "user", "text": transcript}, {"role": "model", "text": reply}])
+    log_event("radio_turn", session=request.state.aerospeak_session_id[-8:], scenario=state["settings"].get("scenario"), synced=bool(state.get("flight_plan")), refreshed=refreshed)
+    state["history"] = state["history"][-12:]
+    try:
+        audio = render_radio_audio(reply)
+        audio_url = f"/audio/{audio.name}"
+    except Exception:
+        audio_url = None
+    return session_response(request, {"text": reply, "transcript": transcript, "audio": audio_url, "debrief": debrief, "context_refreshed": refreshed})
 
-    return JSONResponse({"text": reply, "audio": f"/audio/{out.name}"})
 
-async def audio(request):
+async def api_audio(request):
+    session_for(request)
     name = request.path_params["name"]
-    path = BASE / "audio" / name
+    if not re.fullmatch(r"[a-f0-9]{32}\.wav", name):
+        return session_response(request, {"error": "not_found"}, 404)
+    path = AUDIO_DIR / name
     if not path.exists():
-        return JSONResponse({"error": "not found"}, status_code=404)
+        return session_response(request, {"error": "not_found"}, 404)
     return FileResponse(path, media_type="audio/wav")
 
+
 async def api_settings(request):
+    state = session_for(request)
+    settings = state["settings"]
     if request.method == "GET":
-        return JSONResponse({"simbrief_id": SETTINGS.get("simbrief_id", ""),
-                            "callsign": SETTINGS.get("callsign", ""),
-                            "voice": SETTINGS.get("voice", ""),
-                            "airport": SETTINGS.get("airport", "")})
+        return session_response(request, {**settings, "flight_plan": state.get("flight_plan", {}), "validation": plan_validation(state.get("flight_plan", {})), "scenarios": SCENARIOS, "access_required": bool(ACCESS_CODE), "authorized": state.get("authorized", False)})
     body = await request.json()
-    if "simbrief_id" in body:
-        SETTINGS["simbrief_id"] = str(body["simbrief_id"]).strip()
-    if "callsign" in body:
-        SETTINGS["callsign"] = str(body["callsign"]).strip()
-    if "voice" in body:
-        SETTINGS["voice"] = str(body["voice"]).strip()
-    if "airport" in body:
-        SETTINGS["airport"] = str(body["airport"]).strip().upper()
-    save_settings(SETTINGS)
-    return JSONResponse({"ok": True, "settings": SETTINGS})
+    for key in ("simbrief_id", "callsign", "gate", "airport"):
+        if key in body:
+            settings[key] = str(body[key]).strip().upper() if key != "simbrief_id" else str(body[key]).strip()
+    if body.get("scenario") in SCENARIOS:
+        settings["scenario"] = body["scenario"]
+    return session_response(request, {"ok": True, "settings": settings})
+
+
+async def api_flight_plan_sync(request):
+    state = session_for(request)
+    blocked = require_access(request, state)
+    if blocked:
+        return blocked
+    limited = rate_limited(request, "simbrief", 4, 300)
+    if limited:
+        return limited
+    try:
+        raw_plan = fetch_simbrief_plan(state["settings"].get("simbrief_id"))
+        plan = normalize_flight_plan(raw_plan, state)
+    except ValueError as error:
+        return session_response(request, {"error": "sync_failed", "detail": str(error)}, 400)
+    if not plan.get("origin") or not plan.get("destination"):
+        return session_response(request, {"error": "sync_failed", "detail": "The latest SimBrief briefing is missing a departure or destination airport."}, 400)
+    state["flight_plan"] = plan
+    log_event("flight_plan_synced", session=request.state.aerospeak_session_id[-8:], origin=plan["origin"], destination=plan["destination"])
+    state["settings"]["airport"] = plan["origin"]
+    if plan.get("callsign"):
+        state["settings"]["callsign"] = plan["callsign"]
+    state["last_context_refresh"] = time.time()
+    return session_response(request, {"ok": True, "flight_plan": plan, "validation": plan_validation(plan)})
+
+
+async def api_flight_plan_validate(request):
+    state = session_for(request)
+    refreshed = refresh_live_context(state, force=True)
+    plan = state.get("flight_plan", {})
+    return session_response(request, {"flight_plan": plan, "validation": plan_validation(plan), "context_refreshed": refreshed})
+
 
 async def api_airports(request):
-    """Search airports by ICAO/name/city. Returns compact list."""
-    q = (request.query_params.get("q") or "").strip().upper()
-    if not q:
-        return JSONResponse({"airports": []})
-    out = []
-    for icao, a in APTS.items():
-        if q in icao or q in (a.get("n") or "").upper() or q in (a.get("m") or "").upper():
-            out.append({"icao": icao, "name": a.get("n"), "city": a.get("m"), "country": a.get("c"),
-                        "freqs": a.get("f", {})})
-            if len(out) >= 12:
+    session_for(request)
+    query = (request.query_params.get("q") or "").strip().upper()
+    if len(query) < 2:
+        return session_response(request, {"airports": []})
+    results = []
+    for icao, airport in APTS.items():
+        if query in icao or query in (airport.get("n") or "").upper() or query in (airport.get("m") or "").upper():
+            results.append({"icao": icao, "name": airport.get("n"), "city": airport.get("m"), "country": airport.get("c"), "freqs": airport.get("f", {})})
+            if len(results) >= 12:
                 break
-    return JSONResponse({"airports": out})
+    return session_response(request, {"airports": results})
 
 
 async def api_frequencies(request):
-    icao = (request.path_params["icao"] or "").upper()
-    a = APTS.get(icao)
-    if not a:
-        return JSONResponse({"error": "airport not found"}, status_code=404)
-    return JSONResponse({"icao": icao, "freqs": a.get("f", {}), "runways": a.get("r", [])})
+    session_for(request)
+    icao = request.path_params["icao"].upper()
+    airport = APTS.get(icao)
+    if not airport:
+        return session_response(request, {"error": "airport_not_found"}, 404)
+    return session_response(request, {"icao": icao, "freqs": airport.get("f", {}), "runways": airport.get("r", [])})
 
 
 async def api_atis(request):
-    """Real ATIS from live METAR + airport data."""
-    icao = (request.path_params["icao"] or "").upper()
-    a = APTS.get(icao)
-    if not a:
-        return JSONResponse({"error": "airport not found"}, status_code=404)
-    metar = fetch_metar(icao)
-    if not metar or not metar.get("raw"):
-        return JSONResponse({"error": "no metar", "icao": icao}, status_code=404)
-    wdir = metar.get("wind_dir") or 0
-    wspd = metar.get("wind_spd") or 0
-    wgst = metar.get("wind_gust")
-    act = active_runways(a, wdir)
-    # Build realistic ATIS text (letter starts at A per session)
-    letter = chr(65 + (_ATIS_ROLL.get(icao, 0) % 26))
-    _ATIS_ROLL[icao] = _ATIS_ROLL.get(icao, 0) + 1
-    wind_str = f"wind {wdir:03d} at {wspd}" + (f" gusting {wgst}" if wgst else "")
-    alt = metar.get("altim")
-    # aviationweather.gov returns altim in hPa; ATIS speaks inHg (29.92)
+    state = session_for(request)
+    blocked = require_access(request, state)
+    if blocked:
+        return blocked
+    limited = rate_limited(request, "atis", 6, 300)
+    if limited:
+        return limited
+    icao = request.path_params["icao"].upper()
+    if icao not in APTS:
+        return session_response(request, {"error": "airport_not_found"}, 404)
+    atis, metar = build_atis_text(icao, state["atis_roll"])
+    if not atis:
+        return session_response(request, {"error": "no_metar", "icao": icao}, 404)
     try:
-        alt_inhg = float(alt) / 33.8639
-        alt_str = f"altimeter {alt_inhg:.2f}"
-    except (TypeError, ValueError):
-        alt_str = "altimeter missing"
-    ceil = metar.get("ceil")
-    vis = metar.get("visib")
-    _v = str(vis or "")
-    if _v.endswith("+"):
-        vis_str = f"visibility {_v[:-1]} or greater sm"
-    else:
-        vis_str = f"visibility {_v} sm" if vis else "visibility missing"
-    parts = [
-        f"THIS IS {icao} ATIS INFORMATION {letter}",
-        f"DEPARTURE RUNWAY {act[0] if act else 'XX'}.",
-        wind_str.upper(),
-        vis_str.upper(),
-        (f"CEILING {ceil} HUNDRED" if ceil else "CAVU"),
-        alt_str,
-    ]
-    atis_text = " ".join(parts)
-    audio_url = None
-    try:
-        mp3 = eleven_speak(atis_text)
-        wav = mp3.with_suffix(".wav")
-        import subprocess
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3), "-ar", "44100", "-ac", "1", str(wav)], check=True)
-        pcm = load_wav_bytes(wav.read_bytes())
-        fx = encode_wav(radio_fx(pcm, 44100))
-        out = BASE / "audio" / f"{uuid.uuid4().hex}.wav"
-        out.write_bytes(fx)
-        audio_url = f"/audio/{out.name}"
+        audio = render_radio_audio(atis)
+        audio_url = f"/audio/{audio.name}"
     except Exception:
         audio_url = None
-    return JSONResponse({"icao": icao, "atis": atis_text, "metar": metar.get("raw"), "audio": audio_url})
+    return session_response(request, {"icao": icao, "atis": atis, "metar": (metar or {}).get("raw"), "audio": audio_url})
+
+
+async def api_access(request):
+    state = session_for(request)
+    if not ACCESS_CODE:
+        state["authorized"] = True
+        return session_response(request, {"ok": True, "authorized": True})
+    body = await request.json()
+    candidate = str(body.get("code") or "")
+    state["authorized"] = bool(candidate) and secrets.compare_digest(candidate, ACCESS_CODE)
+    if not state["authorized"]:
+        return session_response(request, {"error": "invalid_access_code", "detail": "That access code is not valid."}, 403)
+    return session_response(request, {"ok": True, "authorized": True})
+
+
+async def api_session(request):
+    state = session_for(request)
+    return session_response(request, {
+        "history": state["history"][-12:],
+        "validation": plan_validation(state.get("flight_plan", {})),
+        "scenario": state["settings"].get("scenario"),
+    })
 
 
 routes = [
     Route("/", index),
+    Route("/healthz", api_health),
     Route("/api/chat", api_chat, methods=["POST"]),
     Route("/api/settings", api_settings, methods=["GET", "POST"]),
+    Route("/api/flight-plan/sync", api_flight_plan_sync, methods=["POST"]),
+    Route("/api/flight-plan/validate", api_flight_plan_validate, methods=["POST"]),
+    Route("/api/session", api_session),
+    Route("/api/access", api_access, methods=["POST"]),
     Route("/api/airports", api_airports),
     Route("/api/frequencies/{icao}", api_frequencies),
     Route("/api/atis/{icao}", api_atis),
-    Route("/audio/{name}", audio),
+    Route("/audio/{name}", api_audio),
     Mount("/static", StaticFiles(directory=str(BASE / "static"))),
 ]
+
 app = Starlette(routes=routes)
 application = app

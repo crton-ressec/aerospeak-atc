@@ -1,17 +1,34 @@
 (() => {
   const $ = id => document.getElementById(id);
   const ptt = $('ptt'), meter = $('meter'), rx = $('rx'), logEl = $('log'), state = $('state');
-  const gear = $('gear'), settings = $('settings'), simbrief = $('simbrief'), callsign = $('callsign'), saveBtn = $('save'), closeBtn = $('close'), saved = $('saved');
-  $('ver').textContent = 'v0.2.0';
-  let mediaRecorder = null, recording = false, ctx = null, analyser = null, raf = null, stream = null;
+  const gear = $('gear'), settings = $('settings'), simbrief = $('simbrief'), callsign = $('callsign'), gate = $('gate'), scenario = $('scenario');
+  const saveBtn = $('save'), closeBtn = $('close'), syncPlan = $('syncPlan'), validatePlan = $('validatePlan'), saved = $('saved'), planstatus = $('planstatus');
+  const accessBlock = $('accessBlock'), accessCode = $('accessCode'), unlock = $('unlock');
+  const apsearch = $('apsearch'), apresults = $('apresults'), freqrow = $('freqrow'), freqBadge = $('freqBadge');
+  $('ver').textContent = 'v0.4.0';
 
-  function log(who, text) {
-    const d = document.createElement('div');
-    d.className = 'msg ' + who;
-    d.innerHTML = `<span class="who">${who === 'pilot' ? 'YOU' : who === 'atc' ? 'ATC' : 'SYS'}</span>${text}`;
-    logEl.appendChild(d); logEl.scrollTop = logEl.scrollHeight;
+  let mediaRecorder = null, recording = false, stream = null, ctx = null, analyser = null;
+  let curIcao = '', curFreqType = 'GND', curFreqs = {};
+  const freqLabel = { ATIS:'ATIS', CLD:'CLNCE', GND:'GND', TWR:'TWR', APP:'APPROACH', DEP:'DEPARTURE' };
+
+  function log(kind, text) {
+    const row = document.createElement('div');
+    row.className = 'msg ' + kind;
+    const who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = kind === 'pilot' ? 'YOU' : kind === 'atc' ? 'ATC' : kind === 'coach' ? 'COACH' : 'SYS';
+    row.append(who, document.createTextNode(text));
+    logEl.appendChild(row); logEl.scrollTop = logEl.scrollHeight;
   }
-  function setState(s) { state.textContent = s; }
+  function setState(text) { state.textContent = text; }
+
+  function renderPlanStatus(plan, validation) {
+    if (!plan || !plan.origin) { planstatus.textContent = 'No flight plan synchronized yet.'; validatePlan.disabled = true; return; }
+    const gateText = plan.gate ? `Gate/stand ${plan.gate}` : 'Gate/stand not supplied';
+    const missing = validation && validation.missing && validation.missing.length ? `\nNeeds attention: ${validation.missing.join(', ')}.` : '';
+    planstatus.textContent = `Synced: ${plan.callsign || 'callsign unavailable'} · ${plan.origin} → ${plan.destination}\n${gateText} · ${plan.aircraft || 'aircraft unavailable'} · cruise ${plan.cruise_altitude || 'not specified'}\nLive METAR/ATIS refresh automatically during radio use.${missing}`;
+    validatePlan.disabled = false;
+  }
 
   async function ensureMic() {
     if (stream) return;
@@ -19,231 +36,193 @@
     ctx = new (window.AudioContext || window.webkitAudioContext)();
     analyser = ctx.createAnalyser(); analyser.fftSize = 512;
     ctx.createMediaStreamSource(stream).connect(analyser);
-    startMeter();
-  }
-
-  function startMeter() {
-    const buf = new Uint8Array(analyser.frequencyBinCount);
+    const samples = new Uint8Array(analyser.frequencyBinCount);
     const tick = () => {
       if (recording && analyser) {
-        analyser.getByteTimeDomainData(buf);
-        let sum = 0; for (let i=0;i<buf.length;i++){ const v=(buf[i]-128)/128; sum+=v*v; }
-        meter.style.width = Math.min(100, Math.sqrt(sum/buf.length)*240) + '%';
+        analyser.getByteTimeDomainData(samples);
+        let total = 0;
+        for (let i = 0; i < samples.length; i++) { const v = (samples[i] - 128) / 128; total += v * v; }
+        meter.style.width = Math.min(100, Math.sqrt(total / samples.length) * 240) + '%';
       }
-      raf = requestAnimationFrame(tick);
+      requestAnimationFrame(tick);
     };
     tick();
   }
 
+  function unlockAudio() {
+    try {
+      const silent = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
+      silent.play().then(() => silent.pause()).catch(() => {});
+    } catch (_) {}
+  }
+
   async function startRecording() {
-    try { await ensureMic(); } catch (e) { log('sys', 'Mic error: ' + e.message); setState('mic blocked'); return; }
+    try { await ensureMic(); } catch (error) { log('sys', 'Microphone unavailable: ' + error.message); setState('mic blocked'); return; }
     if (ctx.state === 'suspended') await ctx.resume();
     const chunks = [];
-    const rec = new MediaRecorder(stream);
-    rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-    rec.onstop = async () => {
-      const blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' });
-      setState('sending…');
-      await sendAudio(blob);
-    };
-    rec.start();
-    mediaRecorder = rec;
-    recording = true;
-    rx.classList.add('live'); state.textContent = 'TX'; ptt.classList.add('hold');
+    const recorder = new MediaRecorder(stream);
+    recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
+    recorder.onstop = () => sendAudio(new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }));
+    recorder.start(); mediaRecorder = recorder; recording = true;
+    rx.classList.add('live'); ptt.classList.add('hold'); setState('TX');
   }
 
   function stopRecording() {
     if (!recording) return;
-    recording = false;
-    rx.classList.remove('live'); ptt.classList.remove('hold'); meter.style.width = '0%';
+    recording = false; rx.classList.remove('live'); ptt.classList.remove('hold'); meter.style.width = '0%';
     if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
   }
 
-  // Unlock iOS audio on first user gesture (PTT pointerdown).
-  let audioUnlocked = false;
-  function unlockAudio() {
-    if (audioUnlocked) return;
-    try {
-      const silent = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
-      silent.play().then(() => { silent.pause(); }).catch(() => {});
-      audioUnlocked = true;
-    } catch (e) {}
-  }
-
-  async function sendAudio(blob) {
-    const fd = new FormData(); fd.append('audio', blob, 'tx.wav');
-    if (callsign.value.trim()) fd.append('callsign', callsign.value.trim());
-    setState('transmitting…');
-    try {
-      const resp = await fetch('/api/chat', { method: 'POST', body: fd });
-      const data = await resp.json();
-      if (!resp.ok) {
-        if (data.error === 'transcribe_failed') {
-          log('sys', "Didn't catch you — press and hold & speak again.");
-        } else if (data.error === 'brain_unavailable') {
-          log('sys', 'ATC brain glitched — try again.');
-        } else {
-          log('sys', 'Error: ' + (data.error || resp.status));
-        }
-        setState('error'); setTimeout(() => setState('ready'), 1500);
-        return;
-      }
-      log('atc', data.text || '');
-      if (data.audio) {
-        const abs = data.audio.startsWith('http') ? data.audio : location.origin + data.audio;
-        // Try autoplay; for strict browsers (Aloha/Safari) show a tappable play button.
-        playAudio(abs);
-        addPlayButton(abs);
-      }
-      setState('ready');
-    } catch (e) { log('sys', 'Network error: ' + e.message); setState('error'); setTimeout(() => setState('ready'), 1500); }
-  }
-
   function playAudio(url) {
-    const abs = url.startsWith('http') ? url : location.origin + url;
-    const audio = new Audio(abs);
-    audio.play().catch(() => {}); // strict browsers: rely on the play button below
+    const audio = new Audio(url.startsWith('http') ? url : location.origin + url);
+    audio.play().catch(() => addPlayButton(url));
   }
 
   function addPlayButton(url) {
-    const abs = url.startsWith('http') ? url : location.origin + url;
-    const row = document.createElement('div');
-    row.className = 'msg playrow';
-    row.innerHTML = `<button class="playbtn" type="button">▶ Play ATC audio</button>`;
-    row.querySelector('.playbtn').addEventListener('click', () => {
-      const a = new Audio(abs);
-      a.play().catch(() => log('sys', 'Still blocked — tap volume or open in Safari'));
-    });
-    logEl.appendChild(row); logEl.scrollTop = logEl.scrollHeight;
+    const row = document.createElement('div'); row.className = 'msg';
+    const button = document.createElement('button'); button.className = 'playbtn'; button.type = 'button'; button.textContent = '▶ Play ATC audio';
+    button.addEventListener('click', () => new Audio(url.startsWith('http') ? url : location.origin + url).play().catch(() => log('sys', 'Playback was blocked by this browser.')));
+    row.appendChild(button); logEl.appendChild(row); logEl.scrollTop = logEl.scrollHeight;
   }
 
-  ptt.addEventListener('pointerdown', e => { e.preventDefault(); unlockAudio(); startRecording(); });
+  function showDebrief(debrief) {
+    if (!debrief) return;
+    const notes = (debrief.notes || []).join(' ');
+    log('coach', `Score ${debrief.score ?? '—'}: ${notes} Next: ${debrief.next_action || 'Continue with the next ATC instruction.'}`);
+  }
 
-  // ---- airport + frequency ----
-  let curIcao = '', curFreqType = 'GND', curFreqs = {};
-  const freqLabel = { 'ATIS':'ATIS', 'CLD':'CLNCE', 'GND':'GND', 'TWR':'TWR', 'APP':'APPROACH', 'DEP':'DEPARTURE' };
-  const apsearch = $('apsearch'), apresults = $('apresults'), freqrow = $('freqrow'), freqBadge = $('freqBadge');
+  async function sendAudio(blob) {
+    if (!blob.size) { setState('ready'); return; }
+    const form = new FormData(); form.append('audio', blob, 'transmission.webm');
+    setState('transmitting…');
+    try {
+      const response = await fetch('/api/chat', { method: 'POST', body: form });
+      const data = await response.json();
+      if (!response.ok) {
+        log('sys', data.detail || data.error || 'Radio request failed.');
+        setState('error'); setTimeout(() => setState('ready'), 1600); return;
+      }
+      if (data.transcript) log('pilot', data.transcript);
+      if (data.text) log('atc', data.text);
+      showDebrief(data.debrief);
+      if (data.audio) playAudio(data.audio);
+      if (data.context_refreshed) planstatus.textContent = planstatus.textContent.replace('Live METAR/ATIS refresh automatically during radio use.', 'Live METAR/ATIS refreshed for this transmission.');
+      setState('ready');
+    } catch (error) { log('sys', 'Network error: ' + error.message); setState('error'); setTimeout(() => setState('ready'), 1600); }
+  }
 
   function setFreq(type) {
-    curFreqType = type;
-    const f = curFreqs[type];
-    freqBadge.innerHTML = f ? `FREQ <b>${f.toFixed(3)}</b>` : (type === 'ATIS' ? 'ATIS · <b>press to play</b>' : 'FREQ —');
+    curFreqType = type; const frequency = curFreqs[type];
+    freqBadge.innerHTML = frequency ? `FREQ <b>${frequency.toFixed(3)}</b>` : (type === 'ATIS' ? 'ATIS · <b>play in Settings</b>' : 'FREQ —');
     renderFreqs();
   }
+
   function renderFreqs() {
-    freqrow.innerHTML = '';
-    ['ATIS','CLD','GND','TWR','APP','DEP'].forEach(t => {
-      const f = curFreqs[t];
-      const b = document.createElement('button');
-      b.className = 'fbt' + (t === curFreqType ? ' active' : '');
-      b.innerHTML = `<span class="type">${freqLabel[t]}</span>${f ? f.toFixed(3) : '—'}`;
-      b.onclick = () => {
-        if (t === 'ATIS') { playAtis(); return; }
-        setFreq(t);
-      };
-      freqrow.appendChild(b);
+    freqrow.textContent = '';
+    ['ATIS','CLD','GND','TWR','APP','DEP'].forEach(type => {
+      const frequency = curFreqs[type]; const button = document.createElement('button');
+      button.className = 'fbt' + (type === curFreqType ? ' active' : '');
+      button.innerHTML = `<span class="type">${freqLabel[type]}</span>${frequency ? Number(frequency).toFixed(3) : '—'}`;
+      button.addEventListener('click', () => type === 'ATIS' ? playAtis() : setFreq(type));
+      freqrow.appendChild(button);
     });
   }
+
   async function loadFreqs(icao) {
     curIcao = icao; curFreqs = {};
-    try {
-      const r = await fetch('/api/frequencies/' + icao);
-      if (r.ok) { const d = await r.json(); curFreqs = d.freqs || {}; }
-    } catch (e) {}
-    // Show GND (or TWR if no GND, else CLD) by default
-    if (curFreqs.GND) setFreq('GND');
-    else if (curFreqs.TWR) setFreq('TWR');
-    else setFreq('ATIS');
-    if (curFreqs.ATIS) setFreq('ATIS');
+    try { const response = await fetch('/api/frequencies/' + encodeURIComponent(icao)); if (response.ok) curFreqs = (await response.json()).freqs || {}; } catch (_) {}
+    if (curFreqs.TWR) setFreq('TWR'); else if (curFreqs.GND) setFreq('GND'); else setFreq('ATIS');
   }
-  async function selectAirport(icao) {
-    apsearch.value = icao;
-    apresults.classList.remove('open');
-    await loadSettings({ icao });
-    await playFreqs(icao);
-  }
-  async function playFreqs(icao) {
-    curIcao = icao; curFreqs = {};
-    try {
-      const r = await fetch('/api/frequencies/' + icao);
-      if (r.ok) { const d = await r.json(); curFreqs = d.freqs || {}; }
-    } catch (e) {}
-    // Default to TWR if available, else GND, else ATIS
-    if (curFreqs.TWR) setFreq('TWR');
-    else if (curFreqs.GND) setFreq('GND');
-    else if (curFreqs.ATIS) setFreq('ATIS');
-    else setFreq('CLD');
-  }
+
   async function playAtis() {
-    if (!curIcao) { log('sys', 'Select an airport first'); return; }
+    if (!curIcao) { log('sys', 'Sync a flight plan or choose an airport in Settings first.'); return; }
     setState('getting ATIS…');
     try {
-      const r = await fetch('/api/atis/' + curIcao);
-      const d = await r.json();
-      if (!r.ok) { log('sys', 'ATIS: ' + (d.error || 'unavailable')); setState('ready'); return; }
-      log('atc', '📻 ' + d.atis);
-      setFreq('ATIS');
-      setState('ready');
-      // Play ATIS via TTS if an audio URL is provided
-      if (d.audio) {
-        const abs = d.audio.startsWith('http') ? d.audio : location.origin + d.audio;
-        playAudio(abs); addPlayButton(abs);
-      }
-    } catch (e) { log('sys', 'ATIS error: ' + e.message); setState('ready'); }
+      const response = await fetch('/api/atis/' + encodeURIComponent(curIcao)); const data = await response.json();
+      if (!response.ok) { log('sys', 'ATIS unavailable: ' + (data.error || 'unknown error')); setState('ready'); return; }
+      log('atc', data.atis); if (data.audio) playAudio(data.audio); setFreq('ATIS');
+    } catch (error) { log('sys', 'ATIS error: ' + error.message); }
+    setState('ready');
   }
-  async function searchAirports(q) {
-    if (!q || q.length < 2) { apresults.classList.remove('open'); return; }
+
+  async function searchAirports(query) {
+    if (query.length < 2) { apresults.classList.remove('open'); return; }
     try {
-      const r = await fetch('/api/airports?q=' + encodeURIComponent(q));
-      const d = await r.json();
-      apresults.innerHTML = '';
-      (d.airports || []).forEach(a => {
-        const row = document.createElement('div');
-        row.className = 'ap';
-        row.innerHTML = `<span><b>${a.icao}</b> ${a.name} · ${a.city} ${a.country}</span><span class="dim">${(a.freqs?.GND || a.freqs?.TWR || '').toFixed(3) || ''}</span>`;
-        row.onclick = () => { selectAirport(a.icao); };
+      const response = await fetch('/api/airports?q=' + encodeURIComponent(query)); const data = await response.json();
+      apresults.textContent = '';
+      (data.airports || []).forEach(airport => {
+        const row = document.createElement('div'); row.className = 'ap';
+        const left = document.createElement('span'); const code = document.createElement('b'); code.textContent = airport.icao;
+        left.append(code, document.createTextNode(` ${airport.name || ''} · ${airport.city || ''} ${airport.country || ''}`)); row.appendChild(left);
+        row.addEventListener('click', async () => { apsearch.value = airport.icao; apresults.classList.remove('open'); await saveSettings({ airport: airport.icao }, false); await loadFreqs(airport.icao); });
         apresults.appendChild(row);
       });
-      if (d.airports.length) apresults.classList.add('open'); else apresults.classList.remove('open');
-    } catch (e) {}
+      apresults.classList.toggle('open', Boolean((data.airports || []).length));
+    } catch (_) { apresults.classList.remove('open'); }
   }
-  apsearch.addEventListener('input', () => searchAirports(apsearch.value.trim()));
-  apsearch.addEventListener('focus', () => { if (apsearch.value.trim().length >= 2) searchAirports(apsearch.value.trim()); });
-  document.addEventListener('click', e => { if (!e.target.closest('.aprow')) apresults.classList.remove('open'); });
 
-  // ---- settings panel ----
-  async function loadSettings({ icao } = {}) {
-    try {
-      const r = await fetch('/api/settings');
-      const d = await r.json();
-      if (icao) {
-        await fetch('/api/settings', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ airport: icao })
-        });
-      }
-      if (d.airport) { playFreqs(d.airport); }
-      if (d.simbrief_id) simbrief.value = d.simbrief_id;
-      if (d.callsign) callsign.value = d.callsign;
-    } catch (e) {}
+  async function saveSettings(extra = {}, announce = true) {
+    const payload = { simbrief_id: simbrief.value.trim(), callsign: callsign.value.trim(), gate: gate.value.trim(), scenario: scenario.value, airport: curIcao, ...extra };
+    const response = await fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+    if (!response.ok) throw new Error('Settings could not be saved.');
+    syncPlan.disabled = !simbrief.value.trim();
+    if (announce) saved.textContent = simbrief.value.trim() ? 'Saved. Sync your latest flight plan when ready.' : 'Saved. Add a SimBrief Pilot ID to enable sync.';
+    return response.json();
   }
-  gear.addEventListener('click', () => { settings.classList.toggle('open'); });
-  closeBtn.addEventListener('click', () => settings.classList.remove('open'));
-  saveBtn.addEventListener('click', async () => {
-    saveBtn.disabled = true;
+
+  async function syncFlightPlan() {
+    syncPlan.disabled = true; syncPlan.textContent = 'Syncing Flight Plan…'; planstatus.textContent = 'Retrieving your latest briefing and live departure context…';
     try {
-      const r = await fetch('/api/settings', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ simbrief_id: simbrief.value.trim(), callsign: callsign.value.trim(), airport: curIcao })
-      });
-      if (r.ok) { saved.textContent = 'Saved ✓'; setTimeout(() => { saved.textContent=''; }, 2000); }
-      else saved.textContent = 'Save failed';
-    } catch (e) { saved.textContent = 'Save failed'; }
-    finally { saveBtn.disabled = false; }
+      const response = await fetch('/api/flight-plan/sync', { method:'POST' }); const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Flight-plan sync failed.');
+      const plan = data.flight_plan || {}; if (plan.callsign) callsign.value = plan.callsign; if (plan.gate) gate.value = plan.gate;
+      if (plan.origin) { apsearch.value = plan.origin; await loadFreqs(plan.origin); }
+      renderPlanStatus(plan, data.validation); saved.textContent = 'Flight plan synchronized.';
+    } catch (error) { planstatus.textContent = error.message; }
+    finally { syncPlan.disabled = !simbrief.value.trim(); syncPlan.textContent = 'Sync Flight Plan'; }
+  }
+
+  async function validateFlightPlan() {
+    validatePlan.disabled = true; validatePlan.textContent = 'Refreshing…';
+    try {
+      const response = await fetch('/api/flight-plan/validate', { method:'POST' }); const data = await response.json();
+      renderPlanStatus(data.flight_plan, data.validation); saved.textContent = data.context_refreshed ? 'Live flight details refreshed.' : 'No synchronized plan to refresh.';
+    } catch (error) { planstatus.textContent = 'Refresh failed: ' + error.message; }
+    finally { validatePlan.textContent = 'Refresh Live Details'; validatePlan.disabled = false; }
+  }
+
+  async function loadSettings() {
+    try {
+      const response = await fetch('/api/settings'); const data = await response.json();
+      simbrief.value = data.simbrief_id || ''; callsign.value = data.callsign || ''; gate.value = data.gate || ''; scenario.value = data.scenario || 'ifr_clearance';
+      accessBlock.hidden = !(data.access_required && !data.authorized);
+      const plan = data.flight_plan || {}; const airport = plan.origin || data.airport || '';
+      syncPlan.disabled = !simbrief.value.trim(); renderPlanStatus(plan, data.validation);
+      if (airport) { curIcao = airport; apsearch.value = airport; await loadFreqs(airport); }
+    } catch (_) { planstatus.textContent = 'Could not restore this browser session.'; }
+  }
+
+  ptt.addEventListener('pointerdown', event => { event.preventDefault(); unlockAudio(); startRecording(); });
+  ptt.addEventListener('pointerup', event => { event.preventDefault(); stopRecording(); });
+  ptt.addEventListener('pointerleave', stopRecording);
+  document.addEventListener('keydown', event => { if (event.code === 'Space' && !event.repeat && !settings.classList.contains('open')) { event.preventDefault(); unlockAudio(); startRecording(); } });
+  document.addEventListener('keyup', event => { if (event.code === 'Space') stopRecording(); });
+  apsearch.addEventListener('input', () => searchAirports(apsearch.value.trim()));
+  document.addEventListener('click', event => { if (!event.target.closest('.aprow')) apresults.classList.remove('open'); });
+  gear.addEventListener('click', () => settings.classList.toggle('open'));
+  closeBtn.addEventListener('click', () => settings.classList.remove('open'));
+  saveBtn.addEventListener('click', async () => { saveBtn.disabled = true; try { await saveSettings(); } catch (error) { saved.textContent = error.message; } finally { saveBtn.disabled = false; } });
+  syncPlan.addEventListener('click', syncFlightPlan);
+  validatePlan.addEventListener('click', validateFlightPlan);
+  unlock.addEventListener('click', async () => {
+    unlock.disabled = true;
+    try {
+      const response = await fetch('/api/access', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ code: accessCode.value }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Access was not accepted.');
+      accessCode.value = ''; accessBlock.hidden = true; saved.textContent = 'Live services unlocked for this browser session.';
+    } catch (error) { saved.textContent = error.message; }
+    finally { unlock.disabled = false; }
   });
   loadSettings();
-  ptt.addEventListener('pointerup', e => { e.preventDefault(); stopRecording(); });
-  ptt.addEventListener('pointerleave', stopRecording);
-  document.addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat) { e.preventDefault(); startRecording(); } });
-  document.addEventListener('keyup', e => { if (e.code === 'Space') stopRecording(); });
 })();
