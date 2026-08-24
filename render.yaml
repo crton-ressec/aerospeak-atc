@@ -15,9 +15,9 @@ services:
       - key: ATC_VOICE
         value: IKne3meq5aSn9XLyUdCD
       - key: GEMINI_MODEL
-        value: gemini-3.6-flash
+        value: gemini-3.1-flash-lite
       - key: GEMINI_LITE
-        value: gemini-flash-lite-latest
+        value: gemini-3.1-flash-lite
       - key: AEROSPEAK_ACCESS_CODE
         sync: false
       - key: DATABASE_URL

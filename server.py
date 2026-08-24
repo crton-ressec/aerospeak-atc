@@ -38,8 +38,10 @@ GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
 ELEVEN_KEY = os.environ.get("ELEVEN_KEY", "")
 VOICE_ID = os.environ.get("ATC_VOICE", "IKne3meq5aSn9XLyUdCD")
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_turbo_v2_5")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-GEMINI_LITE = os.environ.get("GEMINI_LITE", "gemini-flash-lite-latest")
+# Voice requests must prefer the explicitly configured model. The former
+# gemini-flash-lite-latest alias is no longer used as a silent fallback.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_LITE = os.environ.get("GEMINI_LITE") or GEMINI_MODEL
 ACCESS_CODE = os.environ.get("AEROSPEAK_ACCESS_CODE", "").strip()
 AUTH_COOKIE = "aerospeak_auth"
 SIMBRIEF_URL = "https://www.simbrief.com/api/xml.fetcher.php"
@@ -588,6 +590,7 @@ def system_prompt(state):
 You are the exact airport controller selected by the pilot in Settings, speaking concise standard US VHF phraseology. Never describe yourself as a menu-based simulator system.
 Stay strictly within the selected controller's role. If the pilot calls the wrong station, state the correct station and frequency only when that frequency is supplied in the active airport data. If no active station is selected, ask the pilot to select an airport and controller in Settings.
 For departure operations, handle ATIS, IFR clearance, pushback/engine-start coordination, taxi, hold short, line up and wait, takeoff, and departure handoff only within the selected station role. For arrival operations, handle procedural non-radar position reporting, destination ATIS, landing, runway exit, and taxi to parking only within the selected station role.
+For Ground, interpret each request independently: an engine-start or startup request requires engine-start approval; a pushback request requires pushback approval; a taxi request requires a taxi response. Never answer a startup or pushback request with a taxi, route, or generic flight-plan message. Never tell the pilot merely to follow a flight plan; use the synchronized plan only as context for runway, stand, and clearance details.
 A line-up-and-wait instruction is not takeoff clearance. Hold-short, line-up-and-wait, takeoff, and landing instructions require an explicit pilot readback when the session marks one as pending. If the pilot declares an emergency, acknowledge priority and request only the emergency facts you need.
 Never invent an airport, gate, runway, frequency, route, weather report, clearance, charted procedure, traffic, or simulator state. You do not have aircraft telemetry; rely on the pilot's spoken position, altitude, runway status, and flight phase. Keep each reply under 45 words.
 Read numbers as spoken ATC (for example, 'two five zero' and 'squawk one two three four').
@@ -678,12 +681,14 @@ def gemini_call(contents, model=None, retries=3):
                 data = json.loads(response.read().decode())
             text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
             if text:
+                log_event("gemini_request_succeeded", model=model, attempt=attempt + 1)
                 return text
         except HTTPError as error:
+            log_event("gemini_request_http_error", model=model, status=error.code, attempt=attempt + 1)
             if error.code not in (429, 500, 502, 503):
                 raise
         except (KeyError, IndexError, TypeError):
-            pass
+            log_event("gemini_request_empty_response", model=model, attempt=attempt + 1)
         time.sleep(1.5 * (attempt + 1))
     return "Say again?"
 
@@ -783,24 +788,34 @@ def _taxi_request_fields(transcript, state):
     return stand, runway
 
 
+def ground_intent(transcript):
+    """Return a narrow operational intent only when the pilot's words make it unambiguous."""
+    text = (transcript or "").upper()
+    if re.search(r"\b(?:STARTUP|START\s+UP|ENGINE\s+START|START\s+CLEARANCE)\b", text):
+        return "STARTUP"
+    if re.search(r"\bPUSH\s*BACK\b", text):
+        return "PUSHBACK"
+    if re.search(r"\b(?:REQUEST|READY\s+FOR|READY\s+TO)\s+TAXI\b", text):
+        return "TAXI"
+    return ""
+
+
 def ground_taxi_reply(transcript, state):
-    """Create deterministic Ground responses only when the request and route facts are explicit."""
+    """Create a deterministic Ground response only for an explicit, verified Ground intent."""
     if state["settings"].get("controller_type") != "GND":
         return ""
-    text = (transcript or "").upper()
+    intent = ground_intent(transcript)
+    if not intent:
+        return ""
     callsign = _spoken_callsign(state)
-    operation = state.setdefault("operation", {})
 
-    if any(phrase in text for phrase in ("STARTUP", "START UP", "ENGINE START", "START CLEARANCE")):
+    if intent == "STARTUP":
         transition_operation(state, "PUSHBACK", "Engine start approved; awaiting pilot pushback request.")
         return f"{callsign}, engine start approved. Advise ready for pushback."
 
-    if "PUSHBACK" in text or "PUSH BACK" in text:
-        transition_operation(state, "PUSHBACK", "Pushback approved; awaiting pilot ready-to-taxi report.")
+    if intent == "PUSHBACK":
+        transition_operation(state, "PUSHBACK", "Pushback approved; advise ready to taxi when clear of the stand.")
         return f"{callsign}, pushback approved. Advise ready to taxi."
-
-    if "TAXI" not in text and "READY TO TAXI" not in text:
-        return ""
 
     plan = state.get("flight_plan", {})
     stand, spoken_runway = _taxi_request_fields(transcript, state)
@@ -1020,13 +1035,14 @@ async def api_chat(request):
     transcript, reply = parse_combined_reply(combined)
     safety_reply = emergency_reply(transcript, state) or readback_correction(transcript, state)
     deterministic_reply = clearance_delivery_reply(transcript, state) or ground_taxi_reply(transcript, state)
+    reply_source = "safety" if safety_reply else ("verified_controller_rule" if deterministic_reply else "gemini")
     reply = safety_reply or deterministic_reply or enforce_nonradar_reply(reply, state)
     if not reply or reply.lower() == "say again?":
         return session_response(request, {"error": "brain_unavailable", "detail": "ATC could not form a usable reply."}, 502)
     transition_from_reply(reply, transcript, state)
     register_pending_readback(reply, state)
     state["history"].extend([{"role": "user", "text": transcript}, {"role": "model", "text": reply}])
-    log_event("radio_turn", session=request.state.aerospeak_session_id[-8:], controller=state["settings"].get("controller_type"), airport=state["settings"].get("airport"), synced=bool(state.get("flight_plan")), refreshed=refreshed or station_refreshed)
+    log_event("radio_turn", session=request.state.aerospeak_session_id[-8:], controller=state["settings"].get("controller_type"), airport=state["settings"].get("airport"), synced=bool(state.get("flight_plan")), refreshed=refreshed or station_refreshed, gemini_model=GEMINI_LITE, reply_source=reply_source, transcript_received=bool(transcript))
     state["history"] = state["history"][-12:]
     try:
         audio = render_radio_audio(reply)

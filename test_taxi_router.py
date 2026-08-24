@@ -37,6 +37,13 @@ def test_ground_startup_and_pushback_are_distinct():
     assert server.ground_taxi_reply("EuropeAir 447 request pushback", state) == "EUROPEAIR447, pushback approved. Advise ready to taxi."
 
 
+def test_ground_does_not_override_unrelated_call():
+    state = server._blank_state()
+    state["settings"].update({"controller_type": "GND", "callsign": "EUROPEAIR447"})
+    assert server.ground_intent("EuropeAir 447 request progressive taxi assistance") == ""
+    assert server.ground_taxi_reply("EuropeAir 447 request radio check", state) == ""
+
+
 def test_synced_ground_call_uses_planned_runway_and_verified_route():
     state = server._blank_state()
     state["settings"].update({"controller_type": "GND", "airport": "TEST", "callsign": "EUROPEAIR447"})
@@ -63,6 +70,7 @@ def test_unsynced_ground_call_uses_verified_route():
 if __name__ == "__main__":
     test_named_stand_to_runway_route()
     test_ground_startup_and_pushback_are_distinct()
+    test_ground_does_not_override_unrelated_call()
     test_synced_ground_call_uses_planned_runway_and_verified_route()
     test_unsynced_ground_call_uses_verified_route()
     print("AeroSpeak taxi-routing tests passed")
