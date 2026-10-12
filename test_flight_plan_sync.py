@@ -49,6 +49,14 @@ def test_string_wind_direction_is_safe_for_flight_plan_context():
     assert server.active_runways(airport, "not-a-direction") == ["04L"]
 
 
+def test_atis_accepts_normalized_numeric_metar_fields():
+    state = server._blank_state()
+    metar = {"raw": "KJFK 231651Z 24012KT", "wind_dir": 240, "wind_spd": 12, "wind_gust": None, "altim": 1013.0, "visib": "10+", "ceil": None}
+    with patch.object(server, "fetch_metar", return_value=metar):
+        text, _ = server.build_atis_text("KJFK", state["atis_roll"], metar)
+    assert "WIND 240" in text
+
+
 def test_selected_controller_frequency_context():
     state = server._blank_state()
     state["settings"].update({"airport": "KJFK", "controller_type": "GND", "controller_frequency": "121.650"})

@@ -284,14 +284,21 @@ def fetch_metar(icao):
         if not reports:
             return None
         report = reports[0]
+        def number(name, integer=False):
+            value = report.get(name)
+            try:
+                parsed = float(value)
+                return int(parsed) if integer else parsed
+            except (TypeError, ValueError):
+                return None
         return {
             "raw": report.get("rawOb") or report.get("raw_text") or "",
-            "wind_dir": report.get("wdir"),
-            "wind_spd": report.get("wspd"),
-            "wind_gust": report.get("wgst"),
-            "altim": report.get("altim"),
+            "wind_dir": number("wdir", integer=True),
+            "wind_spd": number("wspd", integer=True),
+            "wind_gust": number("wgst", integer=True),
+            "altim": number("altim"),
             "visib": report.get("visib"),
-            "ceil": report.get("cloudbase_feet_agl"),
+            "ceil": number("cloudbase_feet_agl", integer=True),
         }
     except Exception:
         return None
