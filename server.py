@@ -303,6 +303,12 @@ def active_runways(airport, wind_dir):
         return []
     if not wind_dir:
         return [runway[0] for runway in sorted(runways, key=lambda runway: -runway[2])[:2]]
+    # aviationweather.gov returns numeric METAR fields as strings in some
+    # responses. Normalize them before comparing with local runway headings.
+    try:
+        wind_dir = float(wind_dir)
+    except (TypeError, ValueError):
+        return [runway[0] for runway in sorted(runways, key=lambda runway: -runway[2])[:2]]
     scored = []
     for ident, heading, length, surface in runways:
         difference = abs((heading - wind_dir + 180) % 360 - 180)

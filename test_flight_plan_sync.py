@@ -43,6 +43,12 @@ def test_context_injection():
     assert "never claim radar contact" in prompt.lower()
 
 
+def test_string_wind_direction_is_safe_for_flight_plan_context():
+    airport = {"r": [["04L", 40.0, 12000, "ASP"]]}
+    assert server.active_runways(airport, "240") == ["04L"]
+    assert server.active_runways(airport, "not-a-direction") == ["04L"]
+
+
 def test_selected_controller_frequency_context():
     state = server._blank_state()
     state["settings"].update({"airport": "KJFK", "controller_type": "GND", "controller_frequency": "121.650"})
