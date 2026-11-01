@@ -40,7 +40,7 @@ VOICE_ID = os.environ.get("ATC_VOICE", "IKne3meq5aSn9XLyUdCD")
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_turbo_v2_5")
 # Voice requests must prefer the explicitly configured model. The former
 # gemini-flash-lite-latest alias is no longer used as a silent fallback.
-GEMINI_AUDIO_FALLBACK = "gemini-3.1-flash-lite"
+GEMINI_AUDIO_FALLBACK = "gemini-2.0-flash"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", GEMINI_AUDIO_FALLBACK)
 GEMINI_LITE = os.environ.get("GEMINI_LITE") or GEMINI_MODEL
 ACCESS_CODE = os.environ.get("AEROSPEAK_ACCESS_CODE", "").strip()
@@ -550,8 +550,9 @@ def active_controller_context(state):
 
 def fetch_simbrief_plan(pilot_id):
     pilot_id = str(pilot_id or "").strip()
-    if not pilot_id.isdigit():
-        raise ValueError("Enter a valid numeric SimBrief Pilot ID before syncing.")
+    if not pilot_id or len(pilot_id) < 2:
+        raise ValueError("Enter your SimBrief Pilot ID or username before syncing.")
+    # Accept numeric Pilot ID or username; SimBrief resolves both via userid=
     url = f"{SIMBRIEF_URL}?{urlparse.urlencode({'userid': pilot_id, 'json': '1'})}"
     request = Request(url, headers={"User-Agent": "AeroSpeakATC/0.3"})
     try:
@@ -814,17 +815,35 @@ def gemini_transcribe_audio(audio_bytes):
             duration = audio_file.getnframes() / audio_file.getframerate()
         if duration > MAX_AUDIO_SECONDS:
             raise AudioLimitError("Keep each transmission under 90 seconds.")
+        if duration < 0.25:
+            raise ValueError("Transmission too short to transcribe.")
     finally:
         source_path.unlink(missing_ok=True)
         wav_path.unlink(missing_ok=True)
+
+    prompt = (
+        "You are a radio transcription engine for aviation. "
+        "Transcribe the pilot radio transmission exactly as spoken. "
+        "Return ONLY the spoken words. Do not answer, summarize, label, or add punctuation beyond what was said."
+    )
     contents = [{
         "role": "user",
         "parts": [
-            {"text": "Transcribe this pilot radio transmission exactly. Return only the spoken words; do not answer it, summarize it, or add labels."},
+            {"text": prompt},
             {"inline_data": {"mime_type": "audio/wav", "data": base64.b64encode(wav_bytes).decode()}},
         ],
     }]
-    return gemini_call(contents, model=GEMINI_LITE).strip()
+
+    # Prefer the configured lite model, then fall back to a known audio-capable model
+    for model in (GEMINI_LITE, GEMINI_AUDIO_FALLBACK, "gemini-2.0-flash"):
+        try:
+            result = gemini_call(contents, model=model).strip()
+            if result and result.lower() not in ("say again?", "say again"):
+                return result
+        except Exception as error:
+            log_event("transcribe_model_failed", model=model, detail=str(error)[:120])
+            continue
+    return "Say again?"
 
 
 def gemini_controller_reply(transcript, state, route_context=""):
